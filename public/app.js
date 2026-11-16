@@ -362,6 +362,7 @@ function initializeCodeEditor() {
   window.ace.config.set('themePath', '/vendor/ace');
 
   const editor = window.ace.edit(elements.editor);
+  const languageTools = window.ace.require('ace/ext/language_tools');
   editor.setTheme('ace/theme/textmate');
   editor.setOptions({
     animatedScroll: false,
@@ -380,9 +381,25 @@ function initializeCodeEditor() {
     showPrintMargin: false,
     tabSize: 2,
     useSoftTabs: true,
+    ...(languageTools ? {
+      enableBasicAutocompletion: true,
+      enableLiveAutocompletion: true,
+    } : {}),
   });
   editor.session.setMode('ace/mode/latex');
   editor.session.setUseWorker(false);
+  const fileCompleter = {
+    getCompletions(_editor, _session, _pos, prefix, callback) {
+      const line = _session.getLine(_pos.row).slice(0, _pos.column);
+      if (!/(?:\\input|\\include|\\includegraphics)\{[^}]*$/.test(line)) return callback(null, []);
+      const items = state.files.filter((file) => file.type === 'file').map((file) => ({
+        caption: file.path, value: file.path, meta: 'project file', score: 1000,
+      }));
+      callback(null, items.filter((item) => !prefix || item.value.toLowerCase().includes(prefix.toLowerCase())));
+    },
+  };
+  // Completion is optional: a failed extension load must not block the app.
+  languageTools?.addCompleter(fileCompleter);
   editor.renderer.setScrollMargin(18, 36, 0, 0);
   editor.setReadOnly(true);
 
@@ -609,10 +626,15 @@ function setSidebarCollapsed(collapsed) {
   const storedSidebar = isSidebarCollapsed()
     ? panelLayout.preferred?.sidebar || 230
     : currentSizes.sidebar;
+  const nextSizes = sidebarCollapsePanelSizes(
+    collapsed,
+    currentSizes,
+    storedSidebar,
+    elements.sidebarResizer.offsetWidth || 7,
+  );
   panelLayout.preferred = {
+    ...nextSizes,
     sidebar: storedSidebar,
-    preview: currentSizes.preview,
-    codex: currentSizes.codex,
     sidebarCollapsed: collapsed,
     codexCollapsed: isCodexCollapsed(),
   };
@@ -717,6 +739,14 @@ function clamp(value, minimum, maximum) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
 }
 
+function sidebarCollapsePanelSizes(collapsed, currentSizes, sidebarWidth, resizerWidth = 7) {
+  const previewDelta = (collapsed ? 1 : -1) * (sidebarWidth + resizerWidth);
+  return {
+    ...currentSizes,
+    preview: currentSizes.preview + previewDelta,
+  };
+}
+
 function fitPanelSizes(sidebarWidth, previewWidth, codexWidth) {
   const minimums = panelMinimums();
   const collapsedSidebar = isSidebarCollapsed();
@@ -758,12 +788,12 @@ function updateResizerAccessibility(sizes = currentPanelSizes()) {
   const minimums = panelMinimums();
   const occupiedSidebar = isSidebarCollapsed() ? 0 : sizes.sidebar;
   const occupiedCodex = isCodexCollapsed() ? 0 : sizes.codex;
-  const sidebarMaximum = minimums.available - minimums.editor - sizes.preview - occupiedCodex;
-  const previewMaximum = minimums.available - minimums.editor - occupiedSidebar - occupiedCodex;
+  const sidebarMaximum = minimums.available - minimums.editor - minimums.preview - minimums.codex;
   const codexMaximum = minimums.available - minimums.editor - occupiedSidebar - sizes.preview;
+  const editorMaximum = minimums.available - occupiedSidebar - occupiedCodex - minimums.preview;
   const values = [
     [elements.sidebarResizer, sizes.sidebar, minimums.sidebar, sidebarMaximum],
-    [elements.previewResizer, sizes.preview, minimums.preview, previewMaximum],
+    [elements.previewResizer, sizes.preview, minimums.preview, minimums.available - occupiedSidebar - occupiedCodex - minimums.editor],
     [elements.codexResizer, sizes.codex, minimums.codex, codexMaximum],
   ];
   for (const [resizer, value, minimum, maximum] of values) {
@@ -821,14 +851,22 @@ function resizedPanelSizes(kind, startSizes, deltaX) {
   const occupiedSidebar = isSidebarCollapsed() ? 0 : startSizes.sidebar;
   const occupiedCodex = isCodexCollapsed() ? 0 : startSizes.codex;
   if (kind === 'sidebar') {
+    const sidebar = clamp(
+      startSizes.sidebar + deltaX,
+      minimums.sidebar,
+      minimums.available - minimums.preview - minimums.codex - minimums.editor,
+    );
+    // Once the editor reaches its minimum, use the remaining preview/Codex
+    // headroom instead of locking the file divider at its current position.
+    let excess = Math.max(0, sidebar + startSizes.preview + occupiedCodex
+      + minimums.editor - minimums.available);
+    const previewReduction = Math.min(excess, Math.max(0, startSizes.preview - minimums.preview));
+    excess -= previewReduction;
+    const codexReduction = Math.min(excess, Math.max(0, occupiedCodex - minimums.codex));
     return {
-      sidebar: clamp(
-        startSizes.sidebar + deltaX,
-        minimums.sidebar,
-        minimums.available - startSizes.preview - occupiedCodex - minimums.editor,
-      ),
-      preview: startSizes.preview,
-      codex: startSizes.codex,
+      sidebar,
+      preview: startSizes.preview - previewReduction,
+      codex: startSizes.codex - codexReduction,
     };
   }
   if (kind === 'codex') {
@@ -847,7 +885,7 @@ function resizedPanelSizes(kind, startSizes, deltaX) {
   return {
     sidebar: startSizes.sidebar,
     preview: clamp(
-      startSizes.preview + deltaX,
+      startSizes.preview - deltaX,
       minimums.preview,
       minimums.available - occupiedSidebar - occupiedCodex - minimums.editor,
     ),
@@ -859,7 +897,7 @@ function finishPanelResize(event) {
   if (!panelLayout.activeDrag) return;
   if (event?.pointerId !== undefined && event.pointerId !== panelLayout.activeDrag.pointerId) return;
   const { resizer, pointerId } = panelLayout.activeDrag;
-  if (resizer.hasPointerCapture?.(pointerId)) resizer.releasePointerCapture(pointerId);
+  if (pointerId !== undefined && resizer.hasPointerCapture?.(pointerId)) resizer.releasePointerCapture(pointerId);
   resizer.classList.remove('active');
   document.body.classList.remove('resizing-panels');
   panelLayout.activeDrag = null;
@@ -888,7 +926,7 @@ function startPanelResize(event, kind) {
     startX: event.clientX,
     startSizes: sizes,
   };
-  resizer.setPointerCapture?.(event.pointerId);
+  if (event.pointerId !== undefined) resizer.setPointerCapture?.(event.pointerId);
   resizer.classList.add('active');
   document.body.classList.add('resizing-panels');
 }
@@ -923,7 +961,10 @@ function initializePanelResizers() {
     [elements.codexResizer, 'codex'],
   ];
   for (const [resizer, kind] of resizers) {
-    resizer.addEventListener('pointerdown', (event) => startPanelResize(event, kind));
+    resizer.addEventListener('pointerdown', (event) => {
+      if (event.pointerType !== 'mouse') startPanelResize(event, kind);
+    });
+    resizer.addEventListener('mousedown', (event) => startPanelResize(event, kind));
     resizer.addEventListener('keydown', (event) => resizePanelWithKeyboard(event, kind));
     resizer.addEventListener('dblclick', resetPanelLayout);
   }
@@ -936,6 +977,8 @@ function initializePanelResizers() {
   window.addEventListener('pointermove', movePanelResize);
   window.addEventListener('pointerup', finishPanelResize);
   window.addEventListener('pointercancel', finishPanelResize);
+  window.addEventListener('mousemove', movePanelResize);
+  window.addEventListener('mouseup', finishPanelResize);
   window.addEventListener('resize', () => {
     cancelAnimationFrame(panelLayout.resizeFrame);
     panelLayout.resizeFrame = requestAnimationFrame(restorePanelLayout);
@@ -1744,6 +1787,21 @@ function parentDirectory(filePath) {
   return separator < 0 ? '' : filePath.slice(0, separator);
 }
 
+function rootDocumentFor(filePath, content) {
+  const match = String(content || '').match(/^\s*%\s*!TeX\s+root\s*=\s*(\S+)/im);
+  if (!match) return filePath;
+  const root = match[1].replaceAll('\\', '/');
+  const base = parentDirectory(filePath);
+  const parts = `${base}/${root}`.split('/');
+  const normalized = [];
+  for (const part of parts) {
+    if (!part || part === '.') continue;
+    if (part === '..') normalized.pop();
+    else normalized.push(part);
+  }
+  return normalized.join('/');
+}
+
 function isTexFilePath(filePath = '') {
   return String(filePath).toLowerCase().endsWith('.tex');
 }
@@ -1778,7 +1836,172 @@ function expandFileParents(filePath) {
   }
 }
 
+function focusFileRow(filePath) {
+  const row = [...elements.fileTree.querySelectorAll('.tree-row')]
+    .find((candidate) => candidate.dataset.path === filePath);
+  (row || elements.fileTree).focus();
+}
+
+function pathIsWithin(filePath, target) {
+  return Boolean(filePath && (filePath === target || filePath.startsWith(`${target}/`)));
+}
+
+let closeFileContextMenu = () => {};
+let fileOperationRunning = false;
+
+async function performFileAction(action, file) {
+  if (fileOperationRunning || !state.activeProject) return;
+  if (state.compileRunning) {
+    showToast('请等待编译完成后再操作文件。', true);
+    return;
+  }
+  if (action === 'create') {
+    await createFile(file.type === 'directory' ? file.path : parentDirectory(file.path));
+    return;
+  }
+  const affectsEditor = pathIsWithin(state.activePath, file.path);
+  const oldActivePath = state.activePath;
+  const oldMainDocument = state.mainDocument;
+  let destination = '';
+  if (action === 'rename') {
+    const name = window.prompt('重命名为', file.path.split('/').at(-1));
+    if (name === null || name === file.path.split('/').at(-1)) return;
+    if (!name.trim() || /[\\/:*?"<>|]/.test(name) || name === '.' || name === '..' || /[. ]$/.test(name)) {
+      showToast('请输入有效的文件名，不要包含路径分隔符。', true);
+      return;
+    }
+    const parent = parentDirectory(file.path);
+    destination = parent ? `${parent}/${name}` : name;
+    if (state.files.some((entry) => entry.path.toLowerCase() === destination.toLowerCase())) {
+      showToast('已存在同名文件或文件夹。', true);
+      return;
+    }
+  } else if (action === 'delete') {
+    const detail = file.type === 'directory' ? '及其全部内容' : '';
+    if (!window.confirm(`确定删除“${file.path}”${detail}？此操作无法撤销。`)) return;
+  } else return;
+
+  fileOperationRunning = true;
+  try {
+    // Save before moving the open document, and detach its old collaboration path.
+    if (affectsEditor) {
+      if (state.dirty && !await saveFile(true)) return;
+      stopDocumentCollaboration();
+      codeEditor.setReadOnly(true);
+    }
+    if (action === 'rename') {
+      await api('/api/file/rename', { method: 'POST', body: JSON.stringify({ from: file.path, to: destination }) });
+    } else {
+      await api(`/api/file?path=${encodeURIComponent(file.path)}`, { method: 'DELETE' });
+    }
+    const remap = (value) => pathIsWithin(value, file.path)
+      ? (destination ? destination + value.slice(file.path.length) : null) : value;
+    state.collapsedFolders = new Set([...state.collapsedFolders].map(remap).filter(Boolean));
+    state.selectedPath = remap(state.selectedPath);
+    if (affectsEditor) resetEditorState();
+    await refreshFiles();
+    if (pathIsWithin(oldMainDocument, file.path)) {
+      const nextMainDocument = remap(oldMainDocument) || state.mainDocument;
+      state.mainDocument = oldMainDocument;
+      await setMainDocument(nextMainDocument);
+    }
+    if (affectsEditor && destination) {
+      const nextFile = state.files.find((entry) => entry.path === remap(oldActivePath));
+      if (nextFile) await openFile(nextFile, true);
+    }
+    focusFileRow(destination || parentDirectory(file.path));
+    showToast(action === 'rename' ? `已重命名为 ${destination}` : `已删除 ${file.path}`);
+  } catch (error) {
+    if (affectsEditor && state.activePath === oldActivePath) {
+      const connected = await startDocumentCollaboration(oldActivePath);
+      if (!connected) codeEditor.setReadOnly(false);
+    }
+    showToast(error.message, true);
+  } finally {
+    fileOperationRunning = false;
+  }
+}
+
+function initializeFileActions() {
+  const menu = document.createElement('div');
+  menu.className = 'file-context-menu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', '文件操作');
+  menu.hidden = true;
+  document.body.append(menu);
+  let target = null;
+  closeFileContextMenu = (restoreFocus = false) => {
+    menu.hidden = true;
+    if (restoreFocus && target) focusFileRow(target.path);
+    target = null;
+  };
+  for (const [action, label, shortcut] of [['create', '新建文件', ''], ['rename', '重命名', 'F2'], ['delete', '删除', 'Delete']]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.className = action;
+    const title = document.createElement('span');
+    title.textContent = label;
+    const key = document.createElement('kbd');
+    key.textContent = shortcut;
+    button.append(title, key);
+    button.addEventListener('click', () => {
+      const file = target;
+      closeFileContextMenu(true);
+      if (file) void performFileAction(action, file);
+    });
+    menu.append(button);
+  }
+  elements.fileTree.tabIndex = -1;
+  elements.fileTree.addEventListener('contextmenu', (event) => {
+    const row = event.target.closest('.tree-row');
+    if (!row) return;
+    event.preventDefault();
+    target = state.files.find((file) => file.path === row.dataset.path);
+    if (!target) return;
+    row.focus();
+    menu.hidden = false;
+    const bounds = row.getBoundingClientRect();
+    const x = event.clientX || bounds.left;
+    const y = event.clientY || bounds.bottom;
+    menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - menu.offsetWidth - 4))}px`;
+    menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - menu.offsetHeight - 4))}px`;
+    menu.querySelector('button').focus();
+  });
+  elements.fileTree.addEventListener('keydown', (event) => {
+    if (event.repeat || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    const action = event.key === 'F2' ? 'rename' : event.key === 'Delete' ? 'delete' : null;
+    const row = event.target.closest('.tree-row');
+    if (!action || !row) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const file = state.files.find((entry) => entry.path === row.dataset.path);
+    if (file) void performFileAction(action, file);
+  });
+  menu.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeFileContextMenu(true);
+    } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      const buttons = [...menu.querySelectorAll('button')];
+      const index = buttons.indexOf(document.activeElement);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+        : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+      buttons[next].focus();
+    } else if (event.key === 'Tab') closeFileContextMenu(true);
+  });
+  document.addEventListener('pointerdown', (event) => {
+    if (!menu.contains(event.target)) closeFileContextMenu();
+  });
+  elements.fileTree.addEventListener('scroll', () => closeFileContextMenu());
+  window.addEventListener('resize', () => closeFileContextMenu());
+  window.addEventListener('blur', () => closeFileContextMenu());
+}
+
 function renderFileTree() {
+  closeFileContextMenu();
   elements.fileTree.replaceChildren();
 
   if (state.files.length === 0) {
@@ -1872,7 +2095,12 @@ function renderFileTree() {
           target.setAttribute('aria-label', '当前编译对象');
           row.append(target);
         }
-        row.addEventListener('click', () => openFile(file, false, true, true));
+        row.addEventListener('click', async () => {
+          try {
+            await openFile(file, false, true, true);
+            focusFileRow(file.path);
+          } catch (error) { showToast(error.message, true); }
+        });
         node.append(row);
       }
       group.append(node);
@@ -2042,7 +2270,11 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   setDirty(false);
   updateCursorPosition();
   updateCodexContext();
-  if (selectForCompile && isTexFilePath(data.path)) await setMainDocument(data.path);
+  if (selectForCompile && isTexFilePath(data.path)) {
+    const compileTarget = rootDocumentFor(data.path, data.content);
+    const targetFile = state.files.find((item) => item.path === compileTarget);
+    await setMainDocument(targetFile ? compileTarget : data.path);
+  }
   renderFileTree();
   const collaborative = await startDocumentCollaboration(data.path);
   if (!collaborative) {
@@ -4126,24 +4358,29 @@ async function compileDocument() {
   }
 }
 
-async function createFile() {
-  const filePath = window.prompt('请输入新文件路径，例如 sections/method.tex：', 'main.tex');
+async function createFile(directory = '') {
+  if (!state.activeProject || fileOperationRunning) return;
+  const filePath = window.prompt('请输入新文件路径，例如 sections/method.tex：', directory ? `${directory}/untitled.tex` : 'untitled.tex');
   if (!filePath) return;
 
   const initialContent = filePath.toLowerCase().endsWith('.tex')
     ? '% 新建 LaTeX 文件\n'
     : '';
   try {
+    if (state.dirty && !await saveFile(true)) return;
+    fileOperationRunning = true;
     await api('/api/file/new', {
       method: 'POST',
       body: JSON.stringify({ path: filePath, content: initialContent }),
     });
     await refreshFiles();
     const file = state.files.find((item) => item.path === filePath.replaceAll('\\', '/'));
-    if (file) await openFile(file, true, true, true);
+    if (file) await openFile(file, true, true, false);
     showToast(`已创建 ${filePath}`);
   } catch (error) {
     showToast(error.message, true);
+  } finally {
+    fileOperationRunning = false;
   }
 }
 
@@ -4243,7 +4480,10 @@ elements.editorThemeButton.addEventListener('click', toggleTheme);
 elements.compileButton.addEventListener('click', compileDocument);
 elements.sourceToPdfButton.addEventListener('click', jumpSourceToPdf);
 elements.refreshButton.addEventListener('click', refreshWorkspace);
-elements.newFileButton.addEventListener('click', createFile);
+elements.newFileButton.addEventListener('click', () => {
+  const selected = state.files.find((file) => file.path === (state.selectedPath || state.activePath));
+  void createFile(selected?.type === 'directory' ? selected.path : parentDirectory(selected?.path || ''));
+});
 elements.uploadButton.addEventListener('click', () => elements.uploadInput.click());
 elements.uploadInput.addEventListener('change', async () => {
   try {
@@ -4481,4 +4721,5 @@ window.addEventListener('beforeunload', (event) => {
 saveCollaborator();
 applyEditorView();
 initializePanelResizers();
+initializeFileActions();
 initialize();

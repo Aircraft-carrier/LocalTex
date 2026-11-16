@@ -163,7 +163,7 @@ test('serves the editor and local configuration', async () => {
   assert.match(page, /保存并编译 <kbd>Ctrl S<\/kbd>/);
   assert.doesNotMatch(page, /id="saveButton"/);
   assert.match(page, /id="previewResizer"/);
-  assert.match(page, /向右拖动扩大 PDF 预览区/);
+  assert.match(page, /向右拖动扩大编辑区/);
   assert.match(page, /id="pdfPreview" class="pdf-preview-scroll"/);
   assert.match(page, /右键拖动平移/);
   assert.doesNotMatch(page, /<iframe id="pdfPreview"/);
@@ -309,6 +309,10 @@ test('serves the editor and local configuration', async () => {
   assert.equal(latexModeResponse.status, 200);
   assert.match(await latexModeResponse.text(), /LatexHighlightRules/);
 
+  const completionResponse = await fetch(`${baseUrl}/vendor/ace/ext-language_tools.js`);
+  assert.equal(completionResponse.status, 200);
+  assert.match(await completionResponse.text(), /ace\/ext\/language_tools/);
+
   const editorThemeResponse = await fetch(`${baseUrl}/vendor/ace/theme-textmate.js`);
   assert.equal(editorThemeResponse.status, 200);
   assert.match(await editorThemeResponse.text(), /textmate/);
@@ -359,7 +363,8 @@ test('serves the editor and local configuration', async () => {
   assert.match(script, /function isTexFilePath\(/);
   assert.match(script, /async function setMainDocument\(/);
   assert.match(script, /openFile\(file, false, true, true\)/);
-  assert.match(script, /if \(selectForCompile && isTexFilePath\(data\.path\)\) await setMainDocument\(data\.path\)/);
+  assert.match(script, /if \(selectForCompile && isTexFilePath\(data\.path\)\) \{[\s\S]*?rootDocumentFor\(data\.path, data\.content\)/);
+  assert.match(script, /function rootDocumentFor\(/);
   assert.match(script, /elements\.mainDocumentSelect\.disabled = running/);
   assert.match(script, /projectQuery/);
   assert.match(script, /function projectIdFromUrl/);
@@ -367,6 +372,10 @@ test('serves the editor and local configuration', async () => {
   assert.match(script, /updateProjectUrl\(data\.project\.id\)/);
   assert.match(script, /if \(requestedProject\) await openProject\(requestedProject\.id\)/);
   assert.match(script, /pointerdown/);
+  assert.match(script, /startSizes\.preview - deltaX/);
+  assert.match(script, /function sidebarCollapsePanelSizes\(/);
+  assert.match(script, /minimums\.available - occupiedSidebar - occupiedCodex - minimums\.editor/);
+  assert.match(script, /event\.pointerType !== 'mouse'/);
   assert.match(script, /function collapseAllFolders/);
   assert.match(script, /if \(openInitial\) collapseAllFolders\(\)/);
   assert.match(script, /openFile\(initial, true, false\)/);

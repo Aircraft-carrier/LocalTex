@@ -1299,6 +1299,22 @@ async function handleApi(request, response, url) {
     return sendJson(response, 201, { ok: true, path: relativePath });
   }
 
+  if (request.method === 'POST' && url.pathname === '/api/file/rename') {
+    const body = await readJsonBody(request);
+    const from = normalizeRelative(body.from);
+    const to = normalizeRelative(body.to);
+    if (!from || !to) return sendJson(response, 400, { error: 'Both source and destination paths are required.' });
+    await fsp.rename(resolveInside(workspaceRoot, from), resolveInside(workspaceRoot, to));
+    return sendJson(response, 200, { ok: true, path: to });
+  }
+
+  if (request.method === 'DELETE' && url.pathname === '/api/file') {
+    const relativePath = normalizeRelative(url.searchParams.get('path'));
+    if (!relativePath) return sendJson(response, 400, { error: 'A file path is required.' });
+    await fsp.rm(resolveInside(workspaceRoot, relativePath), { recursive: true, force: false });
+    return sendJson(response, 200, { ok: true, path: relativePath });
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/upload') {
     const body = await readJsonBody(request);
     const relativePath = normalizeRelative(body.path);
