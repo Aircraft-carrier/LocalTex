@@ -15,8 +15,8 @@
   "dependencies": {
     "@openai/codex-sdk": "^0.165.0",
     "ace-builds": "1.44.0",
-    "katex": "0.18.1",
-    "pdfjs-dist": "6.1.200",
+    "katex": "0.18.10",
+    "pdfjs-dist": "6.5.438",
     "ws": "8.21.1",
     "yjs": "13.6.31"
   },
