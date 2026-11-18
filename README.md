@@ -10,12 +10,14 @@ LocalTeX 是一个自包含、本地优先的 LaTeX 写作工作台。它既可�
 - Project file browser
 - Text editing for `.tex`, `.bib`, `.sty`, `.cls`, and other text files
 - 使用 `Ctrl+S` 保存并编译
+- 本地模式自动保存，并在刷新或异常退出后恢复未保存草稿
 - 无工具栏、全尺寸 PDF 预览
 - 页面刷新或服务重启后自动恢复最近一次成功编译的 PDF
 - Compile log and extracted LaTeX diagnostics
 - Image and project-file upload
 - 选中 LaTeX 后的 Cursor 风格行内修改与替换预览
 - 支持选区和全文的中英对照翻译
+- 支持 pdfLaTeX、XeLaTeX、LuaLaTeX、BibTeX 和 Biber
 - 局域网多人实时编辑、在线成员显示和自动保存
 - 带随机访问令牌的局域网鉴权
 - 复用主机本地配置、支持权限切换的 Codex 写作与编译助手
@@ -52,6 +54,11 @@ Codex 消息中的 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 及常用公式�
 预览区右上角的“中英对照”页签提供选区或全文翻译。可自动判断方向，也可手动选择
 “中 → 英”或“英 → 中”；LaTeX 命令、引用键、路径和数学公式会保留。行内修改和
 翻译均使用只读文本任务，不会让 Codex 直接修改工作区文件。
+
+主文档可以在首行使用 `% !TeX program = xelatex`、`% !TeX program = lualatex`
+或 `% !TeX program = pdflatex` 指定编译引擎。检测到 `ctex`、`fontspec`、
+`xeCJK` 等宏包时也会优先选择已安装的 XeLaTeX。`biblatex` 项目的 `.bcf`
+文件存在且本机安装了 Biber 时，会自动运行 Biber 并完成后续 LaTeX 编译轮次。
 
 当前版本采用以下权限边界：
 

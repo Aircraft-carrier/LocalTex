@@ -138,6 +138,12 @@ const mimeTypes = {
   '.woff2': 'font/woff2',
   '.wasm': 'application/wasm',
 };
+const securityHeaders = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'SAMEORIGIN',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+});
 
 let compileInProgress = false;
 let browseInProgress = false;
@@ -163,15 +169,24 @@ function requestToken(request, url) {
   return String(request.headers['x-localtex-token'] || url.searchParams.get('token') || '');
 }
 
-function tokenMatches(candidate) {
-  if (!lanSettings?.token || !candidate) return false;
-  const expected = Buffer.from(lanSettings.token);
+function tokenValuesMatch(candidate, expectedValue) {
+  if (!expectedValue || !candidate) return false;
+  const expected = Buffer.from(String(expectedValue));
   const received = Buffer.from(String(candidate));
   return expected.length === received.length && timingSafeEqual(expected, received);
 }
 
+function isAuthorizedAccess(hostRequest, lanEnabled, candidateToken, expectedToken) {
+  return hostRequest || (lanEnabled && tokenValuesMatch(candidateToken, expectedToken));
+}
+
 function isAuthorizedRequest(request, url) {
-  return isHostRequest(request) || (isLanSharingEnabled() && tokenMatches(requestToken(request, url)));
+  return isAuthorizedAccess(
+    isHostRequest(request),
+    isLanSharingEnabled(),
+    requestToken(request, url),
+    lanSettings?.token,
+  );
 }
 
 function isLanSharingEnabled() {
@@ -562,6 +577,7 @@ function browseLocalPath(mode) {
 function sendJson(response, statusCode, value) {
   const body = JSON.stringify(value);
   response.writeHead(statusCode, {
+    ...securityHeaders,
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
@@ -571,6 +587,7 @@ function sendJson(response, statusCode, value) {
 
 function sendText(response, statusCode, value) {
   response.writeHead(statusCode, {
+    ...securityHeaders,
     'Content-Type': 'text/plain; charset=utf-8',
     'Content-Length': Buffer.byteLength(value),
     'Cache-Control': 'no-store',
@@ -590,7 +607,9 @@ async function readJsonBody(request) {
   for await (const chunk of request) {
     total += chunk.length;
     if (total > MAX_BODY_BYTES) {
-      throw new Error('Request body is too large.');
+      const error = new Error('Request body is too large.');
+      error.code = 'REQUEST_TOO_LARGE';
+      throw error;
     }
     chunks.push(chunk);
   }
@@ -640,17 +659,56 @@ function commandPath(command) {
   return null;
 }
 
+const compilerCommands = Object.freeze({
+  pdflatex: { command: 'pdflatex', label: 'pdfLaTeX' },
+  xelatex: { command: 'xelatex', label: 'XeLaTeX' },
+  lualatex: { command: 'lualatex', label: 'LuaLaTeX' },
+  latexmk: { command: 'latexmk', label: 'latexmk' },
+  tectonic: { command: 'tectonic', label: 'Tectonic' },
+});
+
+function availableCompiler(kind) {
+  const definition = compilerCommands[kind];
+  if (!definition) return null;
+  const command = commandPath(definition.command);
+  return command
+    ? { kind, command, label: definition.label }
+    : { kind, command: '', label: definition.label, unavailable: true };
+}
+
+function requestedCompilerKind(source) {
+  const match = String(source || '').match(/^\s*%\s*!?tex\s+(?:ts-)?program\s*=\s*(pdflatex|xelatex|lualatex|latexmk|tectonic)\b/im);
+  return match ? match[1].toLowerCase() : '';
+}
+
+function selectCompiler(source) {
+  const requestedKind = requestedCompilerKind(source);
+  if (requestedKind) return availableCompiler(requestedKind);
+  if (/(?:\\documentclass(?:\[[^\]]*\])?\{ctex(?:art|rep|book|beamer)\}|\\usepackage(?:\[[^\]]*\])?\{ctex\}|\\usepackage(?:\[[^\]]*\])?\{(?:fontspec|xeCJK|polyglossia|unicode-math)\})/i.test(String(source || ''))) {
+    const xelatex = availableCompiler('xelatex');
+    if (xelatex && !xelatex.unavailable) return xelatex;
+  }
+  return availableCompiler('pdflatex')
+    || availableCompiler('latexmk')
+    || availableCompiler('tectonic');
+}
+
 function detectCompiler() {
-  const pdflatex = commandPath('pdflatex');
-  if (pdflatex) return { kind: 'pdflatex', command: pdflatex, label: 'pdfLaTeX' };
+  return availableCompiler('pdflatex')
+    || availableCompiler('latexmk')
+    || availableCompiler('tectonic');
+}
 
-  const latexmk = commandPath('latexmk');
-  if (latexmk) return { kind: 'latexmk', command: latexmk, label: 'latexmk + pdfLaTeX' };
-
-  const tectonic = commandPath('tectonic');
-  if (tectonic) return { kind: 'tectonic', command: tectonic, label: 'Tectonic' };
-
-  return null;
+async function detectProjectCompiler(project) {
+  if (!project?.path || !project?.mainFile) return detectCompiler();
+  try {
+    const mainPath = resolveInside(project.path, project.mainFile);
+    const source = await fsp.readFile(mainPath, 'utf8');
+    const compiler = selectCompiler(source);
+    return compiler?.unavailable ? null : compiler;
+  } catch {
+    return detectCompiler();
+  }
 }
 
 async function listWorkspace(directory, relativeBase = '') {
@@ -735,10 +793,15 @@ function runProcess(command, args, cwd, environment = {}) {
   });
 }
 
-function extractDiagnostics(output) {
+function extractDiagnostics(output, finalPassOnly = false) {
   const diagnostics = [];
   const seen = new Set();
-  const lines = output.split(/\r?\n/);
+  let relevantOutput = String(output || '');
+  if (finalPassOnly) {
+    const passes = [...relevantOutput.matchAll(/^--- pass \d+ ---$/gm)];
+    if (passes.length > 1) relevantOutput = relevantOutput.slice(passes.at(-1).index);
+  }
+  const lines = relevantOutput.split(/\r?\n/);
 
   for (const line of lines) {
     const fileLine = line.match(/^(.*?\.tex):(\d+):\s*(.+)$/i);
@@ -981,11 +1044,11 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
     };
   }
 
-  const compiler = detectCompiler();
-  if (!compiler) {
+  const compiler = selectCompiler(mainSource);
+  if (!compiler || compiler.unavailable) {
     const message = [
-      'No LaTeX compiler was found.',
-      'Install MiKTeX or TeX Live, then ensure latexmk or pdflatex is available in PATH.',
+      `未找到文档请求的 ${compiler?.label || 'LaTeX'} 编译器。`,
+      '请安装对应 TeX 引擎，或修改文件开头的 `% !TeX program` 设置。',
     ].join('\n');
     return {
       ok: false,
@@ -1034,7 +1097,7 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
       const args = ['-X', 'compile', mainName, '--outdir', buildDirectory, '--synctex'];
       commandDescription = `tectonic ${args.join(' ')}`;
       result = await runProcess(compiler.command, args, sourceDirectory);
-    } else {
+    } else if (['pdflatex', 'xelatex', 'lualatex'].includes(compiler.kind)) {
       const args = [
         '-interaction=nonstopmode',
         '-halt-on-error',
@@ -1043,12 +1106,19 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
         `-output-directory=${buildDirectory}`,
         mainName,
       ];
-      commandDescription = `pdflatex ${args.join(' ')}`;
+      commandDescription = `${compiler.kind} ${args.join(' ')}`;
       const runs = [await runProcess(compiler.command, args, sourceDirectory)];
 
       const auxPath = path.join(buildDirectory, `${mainStem}.aux`);
+      const bcfPath = path.join(buildDirectory, `${mainStem}.bcf`);
+      const biber = commandPath('biber');
       const bibtex = commandPath('bibtex');
-      if (bibtex && fs.existsSync(auxPath)) {
+      if (biber && fs.existsSync(bcfPath)) {
+        bibliographyTool = 'Biber';
+        runs.push(await runProcess(biber, [mainStem], buildDirectory, {
+          BIBINPUTS: `${sourceDirectory}${path.delimiter}`,
+        }));
+      } else if (bibtex && fs.existsSync(auxPath)) {
         const auxContents = await fsp.readFile(auxPath, 'utf8').catch(() => '');
         if (auxContents.includes('\\bibdata')) {
           bibliographyTool = 'BibTeX';
@@ -1069,6 +1139,16 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
         code: runs.find((run) => run.code !== 0)?.code ?? 0,
         durationMs: runs.reduce((sum, run) => sum + run.durationMs, 0),
         output: runs.map((run, index) => `--- pass ${index + 1} ---\n${run.output}`).join('\n\n'),
+      };
+    } else {
+      const message = `当前编译流程不支持 ${compiler.label}。`;
+      return {
+        ok: false,
+        compiler: compiler.label,
+        output: message,
+        diagnostics: [{ level: 'error', message }],
+        pdfAvailable: false,
+        compiledAt: new Date().toISOString(),
       };
     }
 
@@ -1091,7 +1171,7 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
       command: commandDescription,
       durationMs: result.durationMs,
       output,
-      diagnostics: extractDiagnostics(output),
+      diagnostics: extractDiagnostics(output, succeeded),
       pdfAvailable: succeeded,
       cleanBuild: true,
       buildSteps,
@@ -1120,6 +1200,7 @@ async function serveFile(response, absolutePath, cache = false) {
   if (!stat.isFile()) throw new Error('Not a file.');
 
   response.writeHead(200, {
+    ...securityHeaders,
     'Content-Type': mimeTypes[path.extname(absolutePath).toLowerCase()] || 'application/octet-stream',
     'Content-Length': stat.size,
     'Cache-Control': cache ? 'public, max-age=300' : 'no-store',
@@ -1274,7 +1355,7 @@ async function handleApi(request, response, url) {
     const project = requestedId
       ? projects.find((item) => item.id === requestedId)
       : projects[0] || null;
-    const compiler = detectCompiler();
+    const compiler = await detectProjectCompiler(requestedId ? project : null);
     const hostRequest = isHostRequest(request);
     return sendJson(response, 200, {
       workspace: project?.path || DEFAULT_WORKSPACE_ROOT,
@@ -1408,6 +1489,7 @@ async function handleApi(request, response, url) {
       const runId = decodeURIComponent(eventsMatch[1]);
       codexService.getJob(runId, project.id);
       response.writeHead(200, {
+        ...securityHeaders,
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
@@ -1607,19 +1689,31 @@ async function handleApi(request, response, url) {
     }
 
     const mainSourcePath = resolveInside(workspaceRoot, artifact.mainFile);
-    const absoluteInput = path.isAbsolute(target.input)
-      ? path.resolve(target.input)
-      : path.resolve(path.dirname(mainSourcePath), target.input);
-    const sourceFile = normalizeRelative(path.relative(workspaceRoot, absoluteInput));
-    const verifiedInput = resolveInside(workspaceRoot, sourceFile);
-    const extension = path.extname(verifiedInput).toLowerCase();
-    if (!textExtensions.has(extension) && extension !== '') {
-      return sendJson(response, 415, { error: 'The mapped source file is not editable text.' });
+    let sourceFile = artifact.mainFile;
+    let column = Number.isFinite(target.column) ? Math.trunc(target.column) : -1;
+    let exactSource = false;
+    try {
+      const absoluteInput = path.isAbsolute(target.input)
+        ? path.resolve(target.input)
+        : path.resolve(path.dirname(mainSourcePath), target.input);
+      const candidateFile = normalizeRelative(path.relative(workspaceRoot, absoluteInput));
+      const verifiedInput = resolveInside(workspaceRoot, candidateFile);
+      const extension = path.extname(verifiedInput).toLowerCase();
+      const generatedBuildFile = candidateFile.split('/').includes(BUILD_DIRECTORY);
+      if (!generatedBuildFile && (textExtensions.has(extension) || extension === '')) {
+        sourceFile = candidateFile;
+        exactSource = true;
+      } else {
+        column = -1;
+      }
+    } catch {
+      // Generated files and TeX distribution sources can point outside the workspace.
+      column = -1;
     }
     return sendJson(response, 200, {
       sourceFile,
-      line: Math.max(1, Math.trunc(target.line)),
-      column: Number.isFinite(target.column) ? Math.trunc(target.column) : -1,
+      line: exactSource ? Math.max(1, Math.trunc(target.line)) : 1,
+      column: sourceFile === artifact.mainFile ? 1 : column,
     });
   }
 
@@ -1693,6 +1787,9 @@ async function requestHandler(request, response) {
     const absolutePath = resolveInside(PUBLIC_ROOT, requestedPath);
     return await serveFile(response, absolutePath, false);
   } catch (error) {
+    if (error.code === 'REQUEST_TOO_LARGE') {
+      return sendJson(response, 413, { error: 'Request body is too large.' });
+    }
     if (error.code === 'ENOENT') {
       return sendJson(response, 404, { error: 'File not found.' });
     }
@@ -1837,4 +1934,11 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createAppServer, parseLocalPickerOutput };
+module.exports = {
+  createAppServer,
+  extractDiagnostics,
+  isAuthorizedAccess,
+  parseLocalPickerOutput,
+  requestedCompilerKind,
+  selectCompiler,
+};

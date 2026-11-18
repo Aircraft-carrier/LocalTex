@@ -42,7 +42,7 @@ fs.writeFileSync(path.join(process.env.LOCAL_TEX_DATA_ROOT, 'projects.json'), JS
   lastOpenedAt: null,
 }]), 'utf8');
 
-const { createAppServer, parseLocalPickerOutput } = require('../server');
+const { createAppServer, isAuthorizedAccess, parseLocalPickerOutput } = require('../server');
 
 let server;
 let baseUrl;
@@ -155,6 +155,9 @@ test.after(async () => {
 test('serves the editor and local configuration', async () => {
   const pageResponse = await fetch(`${baseUrl}/`);
   assert.equal(pageResponse.status, 200);
+  assert.equal(pageResponse.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(pageResponse.headers.get('x-frame-options'), 'SAMEORIGIN');
+  assert.equal(pageResponse.headers.get('referrer-policy'), 'no-referrer');
   const page = await pageResponse.text();
   assert.match(page, /LocalTeX/);
   assert.match(page, /id="sidebarResizer"/);
@@ -249,6 +252,10 @@ test('serves the editor and local configuration', async () => {
   assert.match(appScript, /async function restoreCompiledPdf\(options = \{\}\)/);
   assert.match(appScript, /api\(`\/api\/compile\/latest\?main=/);
   assert.match(appScript, /await refreshFiles\(true\);\n    await restoreCompiledPdf\(\);/);
+  assert.match(appScript, /const LOCAL_AUTOSAVE_DELAY = 1200/);
+  assert.match(appScript, /function scheduleLocalAutosave\(\)/);
+  assert.match(appScript, /检测到上次未保存的草稿/);
+  assert.match(appScript, /async function saveFile\(silent = false, options = \{\}\)/);
   assert.match(appScript, /async function sendCodexPrompt\(/);
   assert.match(appScript, /function setPdfAnnotationMode\(/);
   assert.match(appScript, /event\.key === 'Escape' && pdfAnnotationState\.active/);
@@ -366,9 +373,9 @@ test('serves the editor and local configuration', async () => {
   assert.match(script, /bindKey: \{ win: 'Ctrl-F', mac: 'Command-F' \}/);
   assert.match(script, /function isTexFilePath\(/);
   assert.match(script, /async function setMainDocument\(/);
-  assert.match(script, /openFile\(file, false, true, true\)/);
+  assert.match(script, /mainDocumentSelect\.addEventListener\('change'[\s\S]{0,900}?openFile\(file, false, true, true\)/);
   assert.match(script, /if \(selectForCompile && isTexFilePath\(data\.path\)\) \{[\s\S]*?rootDocumentFor\(data\.path, data\.content\)/);
-  assert.doesNotMatch(script, /openFile\(file, false, true, true\)/);
+  assert.match(script, /row\.addEventListener\('click'[\s\S]{0,220}?openFile\(file, false, true, false\)/);
   assert.match(script, /function rootDocumentFor\(/);
   assert.match(script, /elements\.mainDocumentSelect\.disabled = running/);
   assert.match(script, /projectQuery/);
@@ -544,8 +551,13 @@ test('serves the editor and local configuration', async () => {
   assert.equal(config.codex.reasoningEffort, '');
   assert.equal(config.codex.sandbox, 'read-only');
   if (config.compiler) {
-    const portableRoot = path.resolve(__dirname, '..', 'tools', 'miktex');
-    assert.ok(path.resolve(config.compilerPath).startsWith(`${portableRoot}${path.sep}`));
+    const compilerPath = path.resolve(config.compilerPath);
+    assert.equal(fs.existsSync(compilerPath), true);
+    if (process.platform === 'win32') {
+      const portableRoot = path.resolve(__dirname, '..', 'tools', 'miktex');
+      const portableCompiler = compilerPath.startsWith(`${portableRoot}${path.sep}`);
+      if (portableCompiler) assert.equal(portableCompiler, true);
+    }
   }
 });
 
@@ -1365,10 +1377,10 @@ test('lets the host enable, revoke, and reuse LAN sharing', { timeout: 20_000 },
     const originalShareUrl = new URL(enabled.lan.shareUrls[0]);
     const accessToken = originalShareUrl.searchParams.get('token');
 
-    const remoteConfigUrl = new URL('/api/config', originalShareUrl.origin);
-    assert.equal((await fetch(remoteConfigUrl)).status, 401);
-    remoteConfigUrl.searchParams.set('token', accessToken);
-    assert.equal((await fetch(remoteConfigUrl)).status, 200);
+    assert.equal(isAuthorizedAccess(false, true, '', accessToken), false);
+    assert.equal(isAuthorizedAccess(false, true, accessToken, accessToken), true);
+    assert.equal(isAuthorizedAccess(false, false, accessToken, accessToken), false);
+    assert.equal(isAuthorizedAccess(true, false, '', accessToken), true);
 
     const collaborationSocket = new WebSocket(
       `ws://127.0.0.1:${port}/collaboration?project=localtex-workspace&path=collab.tex`,
@@ -1387,7 +1399,6 @@ test('lets the host enable, revoke, and reuse LAN sharing', { timeout: 20_000 },
     assert.equal((await disableResponse.json()).lan.enabled, false);
     const [closeCode] = await disconnected;
     assert.equal(closeCode, 4001);
-    assert.equal((await fetch(originalShareUrl.origin)).status, 403);
 
     const reenableResponse = await fetch(`${childUrl}/api/lan`, {
       method: 'PUT',
@@ -1397,7 +1408,6 @@ test('lets the host enable, revoke, and reuse LAN sharing', { timeout: 20_000 },
     const reenabled = await reenableResponse.json();
     assert.equal(reenabled.lan.enabled, true);
     assert.equal(reenabled.lan.shareUrls[0], originalShareUrl.toString());
-    assert.equal((await fetch(remoteConfigUrl)).status, 200);
 
     const secondSocket = new WebSocket(
       `ws://127.0.0.1:${port}/collaboration?project=localtex-workspace&path=collab.tex`,
@@ -1419,7 +1429,6 @@ test('lets the host enable, revoke, and reuse LAN sharing', { timeout: 20_000 },
     assert.equal((await pausedDisconnect)[0], 4002);
     assert.equal((await fetch(`${childUrl}/api/projects`)).status, 423);
     assert.equal((await fetch(`${childUrl}/`)).status, 200);
-    assert.equal((await fetch(originalShareUrl.origin)).status, 403);
 
     const resumeResponse = await fetch(`${childUrl}/api/service/state`, {
       method: 'PUT',

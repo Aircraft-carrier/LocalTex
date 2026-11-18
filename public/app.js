@@ -357,9 +357,15 @@ const panelLayout = {
 
 const EDITOR_VIEW_STORAGE_KEY = 'localtex.editor-view.v1';
 const THEME_STORAGE_KEY = 'localtex.theme.v1';
+const LOCAL_DRAFT_STORAGE_PREFIX = 'localtex.draft.v1:';
+const LOCAL_AUTOSAVE_DELAY = 1200;
+const LOCAL_DRAFT_DELAY = 250;
 const EDITOR_FONT_SIZES = [12, 13, 14, 15, 16, 18, 20];
 let activeTheme = loadTheme();
 const editorView = loadEditorView();
+let fileSavePromise = null;
+let localAutosaveTimer = 0;
+let localDraftTimer = 0;
 const codeEditor = initializeCodeEditor();
 applyTheme(activeTheme, false);
 
@@ -1794,6 +1800,7 @@ async function toggleLanSharing() {
   const lan = state.config?.lan;
   if (!lan?.isHost || !lan.available) return;
   const enabled = !lan.enabled;
+  if (enabled && state.dirty && !await saveFile(true)) return;
   elements.shareToggleButton.disabled = true;
   try {
     const data = await api('/api/lan', {
@@ -2053,6 +2060,9 @@ async function loadProjects() {
 }
 
 function resetEditorState() {
+  cancelLocalAutosave();
+  clearTimeout(localDraftTimer);
+  localDraftTimer = 0;
   stopDocumentCollaboration();
   closeInlineEdit(false);
   resetTranslationState();
@@ -2177,6 +2187,78 @@ async function showProjectHome() {
   elements.editorApp.hidden = true;
   elements.projectHome.hidden = false;
   await loadProjects();
+}
+
+function localDraftStorageKey(filePath = state.activePath) {
+  if (!state.activeProject?.id || !filePath) return '';
+  return `${LOCAL_DRAFT_STORAGE_PREFIX}${state.activeProject.id}:${filePath}`;
+}
+
+function readLocalDraft(filePath = state.activePath) {
+  const key = localDraftStorageKey(filePath);
+  if (!key) return null;
+  try {
+    const draft = JSON.parse(localStorage.getItem(key));
+    if (typeof draft?.content !== 'string') return null;
+    return draft;
+  } catch {
+    return null;
+  }
+}
+
+function clearLocalDraft(filePath = state.activePath) {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = 0;
+  const key = localDraftStorageKey(filePath);
+  if (!key) return;
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Draft recovery is best-effort when browser storage is unavailable.
+  }
+}
+
+function writeLocalDraftNow() {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = 0;
+  const key = localDraftStorageKey();
+  if (!key || !state.activePath) return;
+  try {
+    if (!state.dirty || state.config?.lan?.enabled) {
+      localStorage.removeItem(key);
+      return;
+    }
+    localStorage.setItem(key, JSON.stringify({
+      content: codeEditor.getValue(),
+      savedAt: new Date().toISOString(),
+    }));
+  } catch {
+    // The editor remains usable when localStorage quota or policy prevents recovery.
+  }
+}
+
+function scheduleLocalDraftSnapshot() {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = setTimeout(writeLocalDraftNow, LOCAL_DRAFT_DELAY);
+}
+
+function cancelLocalAutosave() {
+  clearTimeout(localAutosaveTimer);
+  localAutosaveTimer = 0;
+}
+
+function scheduleLocalAutosave() {
+  cancelLocalAutosave();
+  if (
+    !state.activePath
+    || !state.dirty
+    || state.compileRunning
+    || state.config?.lan?.enabled
+  ) return;
+  localAutosaveTimer = setTimeout(async () => {
+    localAutosaveTimer = 0;
+    await saveFile(true, { automatic: true });
+  }, LOCAL_AUTOSAVE_DELAY);
 }
 
 function setDirty(value) {
@@ -2646,7 +2728,9 @@ async function refreshWorkspace() {
 
 async function confirmDiscard() {
   if (!state.dirty) return true;
-  return window.confirm('当前文件还有未保存修改。确定放弃这些修改吗？');
+  const discard = window.confirm('当前文件还有未保存修改。确定放弃这些修改吗？');
+  if (discard) clearLocalDraft();
+  return discard;
 }
 
 async function openFile(file, force = false, revealInTree = true, selectForCompile = false) {
@@ -2670,6 +2754,7 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   }
 
   if (!force && file.path !== state.activePath && !await confirmDiscard()) return false;
+  cancelLocalAutosave();
   if (file.path !== state.activePath) {
     closeInlineEdit(false);
     resetTranslationState();
@@ -2682,7 +2767,15 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   state.selectedPath = data.path;
   if (revealInTree) expandFileParents(data.path);
   state.savedContent = data.content;
-  codeEditor.setValue(data.content, -1);
+  const draft = readLocalDraft(data.path);
+  const restoreDraft = Boolean(
+    draft
+    && draft.content !== data.content
+    && window.confirm('检测到上次未保存的草稿。是否恢复这些修改？'),
+  );
+  const initialContent = restoreDraft ? draft.content : data.content;
+  if (draft && !restoreDraft) clearLocalDraft(data.path);
+  codeEditor.setValue(initialContent, -1);
   codeEditor.session.getUndoManager().reset();
   codeEditor.setReadOnly(true);
   setEditorMode(data.path);
@@ -2690,7 +2783,7 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   const fileName = data.path.split('/').at(-1);
   elements.fileType.textContent = fileName.includes('.') ? fileName.split('.').at(-1).toUpperCase().slice(0, 4) : 'TXT';
   elements.sourceToPdfButton.disabled = !data.path.toLowerCase().endsWith('.tex');
-  setDirty(false);
+  setDirty(initialContent !== data.content);
   updateCursorPosition();
   updateCodexContext();
   if (selectForCompile && isTexFilePath(data.path)) {
@@ -2708,10 +2801,14 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   return true;
 }
 
-async function saveFile(silent = false) {
+async function saveFile(silent = false, options = {}) {
   if (!state.activePath) {
     if (!silent) showToast('请先选择一个文本文件。', true);
     return false;
+  }
+
+  if (fileSavePromise) {
+    await fileSavePromise.catch(() => {});
   }
 
   if (!state.dirty) {
@@ -2719,21 +2816,38 @@ async function saveFile(silent = false) {
     return true;
   }
 
-  elements.saveStatus.textContent = '正在保存…';
+  const filePath = state.activePath;
+  const content = codeEditor.getValue();
+  const operation = api('/api/file', {
+    method: 'PUT',
+    body: JSON.stringify({ path: filePath, content }),
+  });
+  fileSavePromise = operation;
+  elements.saveStatus.textContent = options.automatic ? '自动保存中…' : '正在保存…';
   try {
-    const content = codeEditor.getValue();
-    await api('/api/file', {
-      method: 'PUT',
-      body: JSON.stringify({ path: state.activePath, content }),
-    });
-    state.savedContent = content;
-    setDirty(false);
-    if (!silent) showToast(`已保存 ${state.activePath}`);
+    await operation;
+    if (state.activePath === filePath) {
+      state.savedContent = content;
+      const changedAfterSave = codeEditor.getValue() !== content;
+      setDirty(changedAfterSave);
+      if (changedAfterSave) {
+        writeLocalDraftNow();
+        scheduleLocalAutosave();
+      } else {
+        clearLocalDraft(filePath);
+      }
+    }
+    if (!silent && !options.automatic) showToast(`已保存 ${filePath}`);
     return true;
   } catch (error) {
-    elements.saveStatus.textContent = '保存失败';
-    showToast(error.message, true);
+    if (state.activePath === filePath) {
+      elements.saveStatus.textContent = options.automatic ? '自动保存失败' : '保存失败';
+      writeLocalDraftNow();
+    }
+    if (!options.automatic) showToast(error.message, true);
     return false;
+  } finally {
+    if (fileSavePromise === operation) fileSavePromise = null;
   }
 }
 
@@ -5003,6 +5117,7 @@ async function compileDocument() {
   }
   if (state.compileRunning) return false;
 
+  cancelLocalAutosave();
   state.compileRunning = true;
   setCompileButtonRunning(true);
   elements.compileTime.textContent = '正在保存并编译';
@@ -5125,6 +5240,13 @@ codeEditor.session.on('change', () => {
   const changed = codeEditor.getValue() !== state.savedContent;
   if (changed) state.compileStale = true;
   setDirty(changed);
+  if (changed) {
+    scheduleLocalDraftSnapshot();
+    scheduleLocalAutosave();
+  } else {
+    cancelLocalAutosave();
+    clearLocalDraft();
+  }
   updateCursorPosition();
   if (!elements.editorFindbar.hidden) updateEditorFindCount();
 });
@@ -5473,6 +5595,7 @@ window.addEventListener('blur', () => {
 
 window.addEventListener('beforeunload', (event) => {
   if (!state.dirty) return;
+  writeLocalDraftNow();
   event.preventDefault();
   event.returnValue = '';
 });
