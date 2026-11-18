@@ -1657,6 +1657,7 @@ async function startDocumentCollaboration(filePath) {
 function stopDocumentCollaboration() {
   const session = collaborationState.session;
   if (!session) {
+    codeEditor.setReadOnly(false);
     setCollaborationStatus(state.config?.lan?.enabled ? 'ready' : 'local', []);
     return;
   }
@@ -1671,6 +1672,7 @@ function stopDocumentCollaboration() {
   if (session.socket && session.socket.readyState < WebSocket.CLOSING) session.socket.close();
   session.document.destroy();
   collaborationState.session = null;
+  codeEditor.setReadOnly(false);
   setCollaborationStatus(state.config?.lan?.enabled ? 'ready' : 'local', []);
 }
 
@@ -1799,6 +1801,8 @@ async function toggleLanSharing() {
       body: JSON.stringify({ enabled }),
     });
     applyNetworkConfig({ ...state.config, lan: data.lan });
+    if (enabled && state.activePath) await startDocumentCollaboration(state.activePath);
+    if (!enabled) stopDocumentCollaboration();
     showToast(enabled ? '局域网分享已开启。' : '局域网分享已关闭，远端连接已经断开。');
   } catch (error) {
     showToast(error.message, true);
@@ -1831,7 +1835,9 @@ async function setWorkServiceState(active) {
     applyNetworkConfig({ ...state.config, service: data.service, lan: data.lan });
     if (active) {
       await loadProjects();
-      if (state.activePath && state.activeProject) await startDocumentCollaboration(state.activePath);
+      if (state.activePath && state.activeProject && state.config?.lan?.enabled) {
+        await startDocumentCollaboration(state.activePath);
+      }
       showToast('LocalTeX 工作服务已恢复。');
     } else {
       closeShareDialog();
@@ -2509,7 +2515,7 @@ function renderFileTree() {
         }
         row.addEventListener('click', async () => {
           try {
-            await openFile(file, false, true, true);
+            await openFile(file, false, true, false);
             focusFileRow(file.path);
           } catch (error) { showToast(error.message, true); }
         });
@@ -2693,7 +2699,8 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
     await setMainDocument(targetFile ? compileTarget : data.path);
   }
   renderFileTree();
-  const collaborative = await startDocumentCollaboration(data.path);
+  const collaborative = Boolean(state.config?.lan?.enabled)
+    && await startDocumentCollaboration(data.path);
   if (!collaborative) {
     codeEditor.setReadOnly(false);
     codeEditor.focus();

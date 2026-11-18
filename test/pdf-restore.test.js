@@ -127,6 +127,17 @@ Persistent PDF preview test.
     const stale = await (await fetch(`${running.url}/api/compile/latest?main=main.tex`, { headers })).json();
     assert.equal(stale.stale, true);
 
+    fs.writeFileSync(path.join(workspace, 'main.tex'), `${sourceText}${sourceText}`, 'utf8');
+    const duplicateCompile = await fetch(`${running.url}/api/compile`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ mainFile: 'main.tex' }),
+    });
+    const duplicateResult = await duplicateCompile.json();
+    assert.equal(duplicateCompile.status, 422);
+    assert.equal(duplicateResult.ok, false);
+    assert.match(duplicateResult.output, /多个 \\documentclass/);
+
     const pdfResponse = await fetch(`${running.url}/api/pdf?main=main.tex`, { headers });
     assert.equal(pdfResponse.status, 200);
     const pdf = Buffer.from(await pdfResponse.arrayBuffer());

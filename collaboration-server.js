@@ -54,6 +54,8 @@ function attachCollaborationServer(server, {
   resolveDocument,
   loadDocument,
   saveDocument,
+  loadState,
+  saveState,
   endpoint = '/collaboration',
 }) {
   const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
@@ -76,7 +78,12 @@ function attachCollaborationServer(server, {
     const content = room.text.toString();
     room.pendingSaves += 1;
     room.saving = room.saving
-      .then(() => saveDocument(room.context, content))
+      .then(async () => {
+        await saveDocument(room.context, content);
+        if (saveState) {
+          await saveState(room.context, Y.encodeStateAsUpdate(room.document));
+        }
+      })
       .then(() => {
         if (room.text.toString() !== content) return;
         room.dirty = false;
@@ -103,7 +110,7 @@ function attachCollaborationServer(server, {
     ) return false;
 
     room.diskSyncing = Promise.resolve(loadDocument(room.context))
-      .then((content) => {
+      .then(async (content) => {
         if (
           room.destroyed
           || room.dirty
@@ -111,7 +118,12 @@ function attachCollaborationServer(server, {
           || room.pendingSaves > 0
         ) return false;
         const changed = replaceRoomText(room, content, EXTERNAL_LOAD);
-        if (changed) broadcast(room, { type: 'disk-synced' });
+        if (changed) {
+          if (saveState) {
+            await saveState(room.context, Y.encodeStateAsUpdate(room.document));
+          }
+          broadcast(room, { type: 'disk-synced' });
+        }
         return changed;
       })
       .catch((error) => {
@@ -145,8 +157,21 @@ function attachCollaborationServer(server, {
   async function createRoom(context) {
     const document = new Y.Doc();
     const text = document.getText('content');
-    if (context.initialContent) {
+    let restoredState = false;
+    if (loadState) {
+      const persistedState = await loadState(context).catch(() => null);
+      if (persistedState?.length) {
+        Y.applyUpdate(document, persistedState, INITIAL_LOAD);
+        restoredState = true;
+      }
+    }
+    if (!restoredState && context.initialContent) {
       document.transact(() => text.insert(0, context.initialContent), INITIAL_LOAD);
+    } else if (text.toString() !== context.initialContent) {
+      document.transact(() => {
+        if (text.length > 0) text.delete(0, text.length);
+        if (context.initialContent) text.insert(0, context.initialContent);
+      }, EXTERNAL_LOAD);
     }
 
     const room = {
@@ -180,6 +205,9 @@ function attachCollaborationServer(server, {
     if (loadDocument) {
       room.diskSyncTimer = setInterval(() => syncRoomFromDisk(room), DISK_SYNC_INTERVAL_MS);
       room.diskSyncTimer.unref?.();
+    }
+    if (saveState) {
+      await Promise.resolve(saveState(context, Y.encodeStateAsUpdate(document))).catch(() => {});
     }
     rooms.set(context.key, room);
     return room;
@@ -275,6 +303,7 @@ function attachCollaborationServer(server, {
 
     socket.on('close', () => {
       room.clients.delete(socket);
+      if (room.destroyed) return;
       broadcastPresence(room);
       if (room.clients.size > 0) return;
       clearTimeout(room.cleanupTimer);

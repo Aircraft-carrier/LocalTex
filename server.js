@@ -23,6 +23,7 @@ const SERVICE_SETTINGS_FILE = path.join(DATA_ROOT, 'service-settings.json');
 const PROFILE_SETTINGS_FILE = path.join(DATA_ROOT, 'profile-settings.json');
 const CODEX_SETTINGS_FILE = path.join(DATA_ROOT, 'codex-settings.json');
 const CODEX_HOME_SETTING_FILE = path.join(DATA_ROOT, 'codex-home.json');
+const COLLABORATION_STATE_ROOT = path.join(DATA_ROOT, 'collaboration-state');
 const SERVICE_PID_FILE = path.join(DATA_ROOT, 'localtex.pid');
 const HOST = process.env.LOCAL_TEX_HOST || '127.0.0.1';
 const PORT = Number(process.env.LOCAL_TEX_PORT || 4177);
@@ -965,6 +966,20 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
   const sourcePath = resolveInside(workspaceRoot, normalizedMain);
   const sourceStat = await fsp.stat(sourcePath);
   if (!sourceStat.isFile()) throw new Error('The selected main document does not exist.');
+  const mainSource = await fsp.readFile(sourcePath, 'utf8');
+  const documentClassCount = (mainSource.match(/^\s*\\documentclass(?:\[[^\]]*\])?\s*\{/gm) || []).length;
+  const documentEndCount = (mainSource.match(/\\end\s*\{document\}/g) || []).length;
+  if (documentClassCount > 1 || documentEndCount > 1) {
+    const message = '主文档包含多个 \\documentclass 或 \\end{document}。请保留一份完整文档，删除重复拼接内容后再编译。';
+    return {
+      ok: false,
+      compiler: detectCompiler()?.label || null,
+      output: message,
+      diagnostics: [{ level: 'error', message }],
+      pdfAvailable: false,
+      compiledAt: new Date().toISOString(),
+    };
+  }
 
   const compiler = detectCompiler();
   if (!compiler) {
@@ -1715,6 +1730,32 @@ async function resolveCollaborationDocument(projectId, relativePath) {
   };
 }
 
+function collaborationStatePath(context) {
+  const key = createHash('sha256').update(context.key).digest('hex');
+  return path.join(COLLABORATION_STATE_ROOT, `${key}.bin`);
+}
+
+async function loadCollaborationState(context) {
+  try {
+    return await fsp.readFile(collaborationStatePath(context));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  }
+}
+
+async function saveCollaborationState(context, state) {
+  await fsp.mkdir(COLLABORATION_STATE_ROOT, { recursive: true });
+  const statePath = collaborationStatePath(context);
+  const temporaryPath = `${statePath}.${randomUUID()}.tmp`;
+  try {
+    await fsp.writeFile(temporaryPath, Buffer.from(state));
+    await fsp.rename(temporaryPath, statePath);
+  } finally {
+    await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 async function saveCollaborationDocument(context, content) {
   await fsp.writeFile(context.absolutePath, content, 'utf8');
 }
@@ -1735,6 +1776,8 @@ async function createAppServer() {
     resolveDocument: resolveCollaborationDocument,
     loadDocument: loadCollaborationDocument,
     saveDocument: saveCollaborationDocument,
+    loadState: loadCollaborationState,
+    saveState: saveCollaborationState,
   });
   collaborationServer = collaboration;
   server.collaboration = collaboration;

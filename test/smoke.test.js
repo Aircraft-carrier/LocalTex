@@ -368,6 +368,7 @@ test('serves the editor and local configuration', async () => {
   assert.match(script, /async function setMainDocument\(/);
   assert.match(script, /openFile\(file, false, true, true\)/);
   assert.match(script, /if \(selectForCompile && isTexFilePath\(data\.path\)\) \{[\s\S]*?rootDocumentFor\(data\.path, data\.content\)/);
+  assert.doesNotMatch(script, /openFile\(file, false, true, true\)/);
   assert.match(script, /function rootDocumentFor\(/);
   assert.match(script, /elements\.mainDocumentSelect\.disabled = running/);
   assert.match(script, /projectQuery/);
