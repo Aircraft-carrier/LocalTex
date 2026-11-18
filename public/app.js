@@ -2101,6 +2101,7 @@ async function openProject(projectId) {
     updateProjectUrl(data.project.id);
     requestAnimationFrame(restorePanelLayout);
     await refreshFiles(true);
+    await restoreCompiledPdf();
     await loadProjects();
   } catch (error) {
     showToast(error.message, true);
@@ -2590,6 +2591,7 @@ async function setMainDocument(mainFile, persist = true) {
   } catch (error) {
     showToast(`编译对象已切换，但默认设置保存失败：${error.message}`, true);
   }
+  await restoreCompiledPdf();
   return true;
 }
 
@@ -4291,6 +4293,46 @@ function clearPdfPreview() {
   elements.pdfPageIndicator.textContent = '第 — / — 页';
   elements.pdfDownloadButton.disabled = true;
   elements.pdfResetZoomButton.disabled = true;
+}
+
+function formatCompileTime(value) {
+  const date = new Date(value || '');
+  if (Number.isNaN(date.getTime())) return '上次编译';
+  return date.toLocaleString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+async function restoreCompiledPdf(options = {}) {
+  if (!state.activeProject || !state.mainDocument || state.compileRunning) return false;
+  try {
+    const record = await api(`/api/compile/latest?main=${encodeURIComponent(state.mainDocument)}`);
+    if (!record?.pdfAvailable) return false;
+    const compiledAt = formatCompileTime(record.compiledAt);
+    elements.compileLog.textContent = record.output || '已恢复上次成功编译的 PDF。';
+    codexState.compileLogAvailable = true;
+    updateCodexContext();
+    renderDiagnostics(Array.isArray(record.diagnostics) ? record.diagnostics : []);
+    state.compileStale = record.stale === true;
+    elements.compileTime.textContent = record.stale
+      ? `上次编译 · ${compiledAt} · 源码有更新`
+      : `上次编译 · ${compiledAt}`;
+    elements.compileTime.title = record.command || '';
+    elements.previewEmpty.hidden = true;
+    switchPreview('pdf');
+    const pdfUrl = authenticatedResourceUrl('/api/pdf', {
+      main: state.mainDocument,
+      project: state.activeProject.id,
+      t: Date.parse(record.compiledAt || '') || Date.now(),
+    });
+    return await loadPdfPreview(pdfUrl, state.mainDocument, '');
+  } catch (error) {
+    if (!options.silent) showToast(`无法恢复上次编译的 PDF：${error.message}`, true);
+    return false;
+  }
 }
 
 async function renderPdfPages(generation = pdfPreviewState.renderGeneration) {

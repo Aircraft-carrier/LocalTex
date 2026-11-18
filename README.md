@@ -11,6 +11,7 @@ LocalTeX 是一个自包含、本地优先的 LaTeX 写作工作台。它既可�
 - Text editing for `.tex`, `.bib`, `.sty`, `.cls`, and other text files
 - 使用 `Ctrl+S` 保存并编译
 - 无工具栏、全尺寸 PDF 预览
+- 页面刷新或服务重启后自动恢复最近一次成功编译的 PDF
 - Compile log and extracted LaTeX diagnostics
 - Image and project-file upload
 - 选中 LaTeX 后的 Cursor 风格行内修改与替换预览

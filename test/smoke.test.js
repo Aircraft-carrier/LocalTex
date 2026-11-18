@@ -231,6 +231,7 @@ test('serves the editor and local configuration', async () => {
   assert.match(page, /id="codexPermissionSelect"/);
   assert.match(page, /value="workspace-write">项目可写/);
   assert.match(page, /value="full-access">Full access/);
+  assert.match(page, /value="max">Max/);
   assert.match(page, /本机 Codex 配置/);
   assert.doesNotMatch(page, /id="shareButton"/);
   assert.match(page, /\/vendor\/ace\/ace\.js/);
@@ -245,6 +246,9 @@ test('serves the editor and local configuration', async () => {
   const appScript = await appResponse.text();
   assert.match(appScript, /async function previewPdfFile\(file\)/);
   assert.match(appScript, /loadPdfPreview\(pdfUrl, '', file\.path\)/);
+  assert.match(appScript, /async function restoreCompiledPdf\(options = \{\}\)/);
+  assert.match(appScript, /api\(`\/api\/compile\/latest\?main=/);
+  assert.match(appScript, /await refreshFiles\(true\);\n    await restoreCompiledPdf\(\);/);
   assert.match(appScript, /async function sendCodexPrompt\(/);
   assert.match(appScript, /function setPdfAnnotationMode\(/);
   assert.match(appScript, /event\.key === 'Escape' && pdfAnnotationState\.active/);

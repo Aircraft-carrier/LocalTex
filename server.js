@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
+const { createHash, randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const { attachCollaborationServer } = require('./collaboration-server');
 const { createCodexService } = require('./codex-service');
@@ -29,6 +29,7 @@ const PORT = Number(process.env.LOCAL_TEX_PORT || 4177);
 const NETWORK_CAPABLE = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
 const MAX_BODY_BYTES = 30 * 1024 * 1024;
 const BUILD_DIRECTORY = '.tex-build';
+const COMPILE_MANIFEST_FILE = '.localtex-compile.json';
 const LOCAL_PICKER_RESULT_PREFIX = '__LOCALTEX_SELECTED_PATH__:';
 
 function expandHomePath(value) {
@@ -100,6 +101,20 @@ const textExtensions = new Set([
   '.txt',
   '.yaml',
   '.yml',
+]);
+const compileInputExtensions = new Set([
+  '.bib',
+  '.bst',
+  '.cls',
+  '.csv',
+  '.eps',
+  '.jpeg',
+  '.jpg',
+  '.pdf',
+  '.png',
+  '.sty',
+  '.svg',
+  '.tex',
 ]);
 
 const mimeTypes = {
@@ -777,13 +792,128 @@ function parseSynctexOutput(output) {
   return records;
 }
 
-function compiledArtifact(projectId, mainFile) {
+function stableCompilePaths(workspaceRoot, mainFile) {
   const normalizedMain = normalizeRelative(mainFile);
-  const record = compileHistory.get(`${projectId}:${normalizedMain}`);
+  if (path.extname(normalizedMain).toLowerCase() !== '.tex') return null;
+  const relativeDirectory = path.dirname(normalizedMain) === '.' ? '' : path.dirname(normalizedMain);
+  const buildParentDirectory = resolveInside(
+    workspaceRoot,
+    path.join(BUILD_DIRECTORY, relativeDirectory),
+  );
+  const mainStem = path.basename(normalizedMain, '.tex');
+  const stableBuildDirectory = path.join(buildParentDirectory, mainStem);
+  return {
+    normalizedMain,
+    buildParentDirectory,
+    stableBuildDirectory,
+    mainStem,
+    pdfPath: path.join(stableBuildDirectory, `${mainStem}.pdf`),
+    logPath: path.join(stableBuildDirectory, `${mainStem}.log`),
+    manifestPath: path.join(stableBuildDirectory, COMPILE_MANIFEST_FILE),
+  };
+}
+
+function restoredCompileRecord(workspaceRoot, projectId, mainFile) {
+  const paths = stableCompilePaths(workspaceRoot, mainFile);
+  if (!paths) return null;
+  const key = `${projectId}:${paths.normalizedMain}`;
+  const cached = compileHistory.get(key);
+  if (cached?.pdfPath && fs.existsSync(cached.pdfPath)) return cached;
+
+  if (!fs.existsSync(paths.pdfPath)) return cached || null;
+  let manifest = {};
+  try {
+    manifest = JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8'));
+  } catch {
+    // Older builds and interrupted writes can be restored from the PDF and TeX log.
+  }
+  let logOutput = '';
+  try {
+    logOutput = fs.readFileSync(paths.logPath, 'utf8');
+  } catch {
+    // The PDF is still usable when its TeX log is unavailable.
+  }
+  const pdfStat = fs.statSync(paths.pdfPath);
+  const compiler = detectCompiler();
+  const record = {
+    ok: true,
+    compiler: String(manifest.compiler || compiler?.label || 'pdfLaTeX'),
+    command: String(manifest.command || ''),
+    durationMs: Number(manifest.durationMs) || 0,
+    output: String(manifest.output || logOutput || '已恢复上次成功编译的 PDF。'),
+    diagnostics: Array.isArray(manifest.diagnostics) ? manifest.diagnostics : extractDiagnostics(logOutput),
+    pdfAvailable: true,
+    cleanBuild: manifest.cleanBuild !== false,
+    buildSteps: Number(manifest.buildSteps) || 0,
+    bibliographyTool: manifest.bibliographyTool || null,
+    compiledAt: String(manifest.compiledAt || pdfStat.mtime.toISOString()),
+    sourceFingerprint: String(manifest.sourceFingerprint || ''),
+    restored: true,
+  };
+  compileHistory.set(key, { ...record, pdfPath: paths.pdfPath });
+  return compileHistory.get(key);
+}
+
+function fileDigest(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.once('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.once('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+async function compileInputFingerprint(workspaceRoot) {
+  const files = (await listWorkspace(workspaceRoot)).filter((file) => {
+    if (file.type !== 'file') return false;
+    const extension = path.extname(file.path).toLowerCase();
+    return Boolean(extension && compileInputExtensions.has(extension));
+  });
+  const hash = createHash('sha256');
+  for (const file of files) {
+    hash.update(file.path);
+    hash.update('\0');
+    hash.update(await fileDigest(resolveInside(workspaceRoot, file.path)));
+    hash.update('\0');
+  }
+  return `sha256:${hash.digest('hex')}`;
+}
+
+async function compileRecordIsStale(workspaceRoot, record) {
+  if (record?.sourceFingerprint) {
+    try {
+      return (await compileInputFingerprint(workspaceRoot)) !== record.sourceFingerprint;
+    } catch {
+      return true;
+    }
+  }
+  const compiledAt = Date.parse(record?.compiledAt || '');
+  if (!Number.isFinite(compiledAt)) return true;
+  try {
+    const files = await listWorkspace(workspaceRoot);
+    return files.some((file) => {
+      if (file.type !== 'file') return false;
+      const extension = path.extname(file.path).toLowerCase();
+      if (extension && !compileInputExtensions.has(extension)) return false;
+      const modifiedAt = Date.parse(file.modifiedAt || '');
+      return Number.isFinite(modifiedAt) && modifiedAt > compiledAt;
+    });
+  } catch {
+    return true;
+  }
+}
+
+function compiledArtifact(workspaceRoot, projectId, mainFile) {
+  const record = restoredCompileRecord(workspaceRoot, projectId, mainFile);
   if (!record?.pdfPath || !fs.existsSync(record.pdfPath)) return null;
   const stem = record.pdfPath.replace(/\.pdf$/i, '');
   const synctexPath = [`${stem}.synctex.gz`, `${stem}.synctex`].find((candidate) => fs.existsSync(candidate));
-  return { mainFile: normalizedMain, pdfPath: record.pdfPath, synctexPath };
+  return {
+    mainFile: normalizeRelative(mainFile),
+    pdfPath: record.pdfPath,
+    synctexPath,
+  };
 }
 
 async function prepareCleanBuildArea(buildParentDirectory, mainStem, stableBuildDirectory) {
@@ -865,6 +995,7 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
   await fsp.mkdir(buildParentDirectory, { recursive: true });
   await prepareCleanBuildArea(buildParentDirectory, mainStem, stableBuildDirectory);
   await fsp.mkdir(buildDirectory);
+  const sourceFingerprint = await compileInputFingerprint(workspaceRoot).catch(() => '');
 
   try {
     let result;
@@ -951,9 +1082,17 @@ async function compileTex(mainFile, workspaceRoot, projectId) {
       buildSteps,
       bibliographyTool: bibliographyTool || null,
       compiledAt: new Date().toISOString(),
+      sourceFingerprint,
     };
 
     compileHistory.set(`${projectId}:${normalizedMain}`, { ...record, pdfPath });
+    if (succeeded) {
+      await fsp.writeFile(
+        path.join(stableBuildDirectory, COMPILE_MANIFEST_FILE),
+        `${JSON.stringify(record, null, 2)}\n`,
+        'utf8',
+      ).catch((error) => console.warn(`Could not persist compile metadata: ${error.message}`));
+    }
     return record;
   } finally {
     await fsp.rm(buildDirectory, { recursive: true, force: true }).catch(() => {});
@@ -1223,7 +1362,8 @@ async function handleApi(request, response, url) {
     if (request.method === 'POST' && url.pathname === '/api/codex/runs') {
       const body = await readJsonBody(request);
       const mainFile = normalizeRelative(body.mainFile || project.mainFile || '');
-      const compileRecord = compileHistory.get(`${project.id}:${mainFile}`);
+      const compileRecord = compileHistory.get(`${project.id}:${mainFile}`)
+        || restoredCompileRecord(workspaceRoot, project.id, mainFile);
       try {
         const run = await codexService.start(project, body, compileRecord?.output || '');
         return sendJson(response, 202, { run });
@@ -1376,7 +1516,7 @@ async function handleApi(request, response, url) {
 
   if (request.method === 'POST' && url.pathname === '/api/synctex/view') {
     const body = await readJsonBody(request);
-    const artifact = compiledArtifact(project.id, body.mainFile);
+    const artifact = compiledArtifact(workspaceRoot, project.id, body.mainFile);
     if (!artifact) {
       return sendJson(response, 404, { error: 'Compile the main document before using source-to-PDF positioning.' });
     }
@@ -1424,7 +1564,7 @@ async function handleApi(request, response, url) {
 
   if (request.method === 'POST' && url.pathname === '/api/synctex/edit') {
     const body = await readJsonBody(request);
-    const artifact = compiledArtifact(project.id, body.mainFile);
+    const artifact = compiledArtifact(workspaceRoot, project.id, body.mainFile);
     if (!artifact) {
       return sendJson(response, 404, { error: 'Compile the main document before using PDF-to-source positioning.' });
     }
@@ -1470,15 +1610,18 @@ async function handleApi(request, response, url) {
 
   if (request.method === 'GET' && url.pathname === '/api/compile/latest') {
     const mainFile = normalizeRelative(url.searchParams.get('main') || '');
-    const record = compileHistory.get(`${project.id}:${mainFile}`);
+    const record = restoredCompileRecord(workspaceRoot, project.id, mainFile);
     if (!record) return sendJson(response, 404, { error: 'No compile result is available.' });
     const { pdfPath: _pdfPath, ...publicRecord } = record;
-    return sendJson(response, 200, publicRecord);
+    return sendJson(response, 200, {
+      ...publicRecord,
+      stale: await compileRecordIsStale(workspaceRoot, record),
+    });
   }
 
   if (request.method === 'GET' && url.pathname === '/api/pdf') {
     const mainFile = normalizeRelative(url.searchParams.get('main') || '');
-    const record = compileHistory.get(`${project.id}:${mainFile}`);
+    const record = restoredCompileRecord(workspaceRoot, project.id, mainFile);
     if (!record?.pdfPath || !fs.existsSync(record.pdfPath)) {
       return sendJson(response, 404, { error: 'Compile the document before opening its PDF.' });
     }
