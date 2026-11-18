@@ -22,6 +22,7 @@ const LAN_SETTINGS_FILE = path.join(DATA_ROOT, 'lan-settings.json');
 const SERVICE_SETTINGS_FILE = path.join(DATA_ROOT, 'service-settings.json');
 const PROFILE_SETTINGS_FILE = path.join(DATA_ROOT, 'profile-settings.json');
 const CODEX_SETTINGS_FILE = path.join(DATA_ROOT, 'codex-settings.json');
+const CODEX_HOME_SETTING_FILE = path.join(DATA_ROOT, 'codex-home.json');
 const SERVICE_PID_FILE = path.join(DATA_ROOT, 'localtex.pid');
 const HOST = process.env.LOCAL_TEX_HOST || '127.0.0.1';
 const PORT = Number(process.env.LOCAL_TEX_PORT || 4177);
@@ -29,6 +30,37 @@ const NETWORK_CAPABLE = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
 const MAX_BODY_BYTES = 30 * 1024 * 1024;
 const BUILD_DIRECTORY = '.tex-build';
 const LOCAL_PICKER_RESULT_PREFIX = '__LOCALTEX_SELECTED_PATH__:';
+
+function expandHomePath(value) {
+  const rawPath = String(value || '').trim();
+  if (rawPath === '~') return os.homedir();
+  if (rawPath.startsWith('~/') || rawPath.startsWith('~\\')) {
+    return path.join(os.homedir(), rawPath.slice(2));
+  }
+  return rawPath;
+}
+
+function loadConfiguredCodexHome() {
+  if (process.env.CODEX_HOME) return;
+  try {
+    const setting = JSON.parse(fs.readFileSync(CODEX_HOME_SETTING_FILE, 'utf8'));
+    const configuredPath = expandHomePath(setting?.path);
+    if (!configuredPath) return;
+    const resolvedPath = path.isAbsolute(configuredPath)
+      ? path.resolve(configuredPath)
+      : path.resolve(APP_ROOT, configuredPath);
+    if (!fs.statSync(resolvedPath).isDirectory()) {
+      throw new Error('The configured Codex home is not a folder.');
+    }
+    process.env.CODEX_HOME = resolvedPath;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn(`Could not load Codex home setting: ${error.message}`);
+    }
+  }
+}
+
+loadConfiguredCodexHome();
 
 const ignoredNames = new Set([
   '.git',

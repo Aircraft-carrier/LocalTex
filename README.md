@@ -28,6 +28,18 @@ LocalTeX 是一个自包含、本地优先的 LaTeX 写作工作台。它既可�
 网页、`data` 或论文目录中复制 API Key。修改本机 Codex 配置后，重新启动
 LocalTeX 服务即可生效。
 
+后台启动时如果没有显式设置 `CODEX_HOME`，LocalTeX 会读取主机私有的
+`data/codex-home.json`，例如：
+
+```json
+{
+  "path": "/Users/name/.codex-deepseek"
+}
+```
+
+显式环境变量的优先级更高。该设置只保存 Codex Home 路径，不复制其中的
+`auth.json`、API Key 或其他凭据。
+
 Codex 消息中的 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 及常用公式环境会由
 随项目安装的 KaTeX 在本地渲染；代码块不会被当成公式处理，复制渲染结果时仍会
 保留对应的 TeX 源码。

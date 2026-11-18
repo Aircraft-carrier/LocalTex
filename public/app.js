@@ -323,13 +323,14 @@ const translationState = {
   sourceLanguage: '',
   output: '',
 };
-const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const CODEX_REASONING_LABELS = Object.freeze({
   minimal: 'Minimal',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
   xhigh: 'XHigh',
+  max: 'Max',
 });
 const CODEX_MATH_DELIMITERS = [
   { left: '$$', right: '$$', display: true },
