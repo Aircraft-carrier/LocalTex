@@ -149,6 +149,47 @@
               <button id="editorFindClose" class="editor-find-close" type="button" title="关闭（Esc）" aria-label="关闭查找"><span aria-hidden="true">×</span></button>
             </div>
           </div>
+          <button class="inline-edit-launcher" id="inlineEditLauncher" type="button" title="修改选区（Ctrl/⌘+K）" hidden>
+            <span aria-hidden="true">✦</span>
+            <span>修改</span>
+          </button>
+          <section class="inline-edit-popover" id="inlineEditPopover" role="dialog" aria-labelledby="inlineEditTitle" hidden>
+            <form id="inlineEditForm">
+              <header class="inline-edit-header">
+                <div>
+                  <span class="inline-edit-kicker">INLINE EDIT</span>
+                  <strong id="inlineEditTitle">修改选区</strong>
+                </div>
+                <span class="inline-edit-selection-meta" id="inlineEditSelectionMeta">0 字符</span>
+              </header>
+              <label class="inline-edit-prompt" for="inlineEditPrompt">
+                <textarea id="inlineEditPrompt" rows="2" maxlength="12000" placeholder="描述要如何修改这段 LaTeX…" spellcheck="false"></textarea>
+              </label>
+              <div class="inline-edit-presets" aria-label="常用修改">
+                <button type="button" data-inline-preset="润色这段学术表达，保持原意和 LaTeX 结构">润色</button>
+                <button type="button" data-inline-preset="修正语法、拼写和 LaTeX 格式问题，只做必要修改">修正</button>
+                <button type="button" data-inline-preset="在不丢失信息的前提下精简这段内容">精简</button>
+              </div>
+              <div class="inline-edit-preview" id="inlineEditPreview" hidden>
+                <div class="inline-edit-preview-block original">
+                  <span>原文</span>
+                  <pre id="inlineEditOriginal"></pre>
+                </div>
+                <div class="inline-edit-preview-block proposed">
+                  <span>修改后</span>
+                  <pre id="inlineEditProposed"></pre>
+                </div>
+              </div>
+              <div class="inline-edit-status" id="inlineEditStatus" role="status" aria-live="polite"></div>
+              <footer class="inline-edit-actions">
+                <span class="inline-edit-shortcut"><kbd>Ctrl/⌘</kbd><kbd>↵</kbd></span>
+                <button class="inline-edit-cancel" id="inlineEditCancelButton" type="button">取消</button>
+                <button class="inline-edit-stop" id="inlineEditStopButton" type="button" hidden>停止</button>
+                <button class="inline-edit-run" id="inlineEditRunButton" type="submit">生成修改</button>
+                <button class="inline-edit-apply" id="inlineEditApplyButton" type="button" hidden>应用修改</button>
+              </footer>
+            </form>
+          </section>
           <div
             id="editor"
             class="code-editor"
@@ -204,6 +245,7 @@
           <div class="tabs" role="tablist" aria-label="预览选项">
             <button class="tab active" id="pdfTab" type="button" role="tab" aria-selected="true" title="查看 PDF 预览">PDF 预览</button>
             <button class="tab" id="logTab" type="button" role="tab" aria-selected="false">编译日志</button>
+            <button class="tab" id="translationTab" type="button" role="tab" aria-selected="false" aria-controls="translationPanel">中英对照</button>
           </div>
           <div class="preview-heading-meta">
             <span id="compileTime" class="compile-time">尚未编译</span>
@@ -255,6 +297,46 @@
         <div id="logPanel" class="log-panel" role="tabpanel" hidden>
           <div id="diagnostics" class="diagnostics"></div>
           <pre id="compileLog">尚无编译日志。</pre>
+        </div>
+
+        <div id="translationPanel" class="translation-panel" role="tabpanel" hidden>
+          <div class="translation-toolbar">
+            <div class="translation-heading-copy">
+              <span class="eyebrow">BILINGUAL</span>
+              <strong>中英对照</strong>
+              <span id="translationSourceMeta">尚未载入文本</span>
+            </div>
+            <div class="translation-controls">
+              <label class="translation-language-control">
+                <span>语言</span>
+                <select id="translationLanguageSelect" aria-label="翻译方向">
+                  <option value="auto">自动</option>
+                  <option value="zh-en">中 → 英</option>
+                  <option value="en-zh">英 → 中</option>
+                </select>
+              </label>
+              <button class="translation-refresh-button" id="translationRefreshButton" type="button" title="重新读取选区；没有选区时读取当前文件">载入</button>
+              <button class="translation-stop-button" id="translationStopButton" type="button" hidden>停止</button>
+              <button class="translation-run-button" id="translationRunButton" type="button"><span aria-hidden="true">译</span> 翻译</button>
+            </div>
+          </div>
+          <div class="translation-columns">
+            <section class="translation-column source" aria-labelledby="translationSourceTitle">
+              <header>
+                <strong id="translationSourceTitle">原文</strong>
+                <span id="translationSourceLanguage">—</span>
+              </header>
+              <pre id="translationSourceText"></pre>
+            </section>
+            <section class="translation-column target" aria-labelledby="translationTargetTitle">
+              <header>
+                <strong id="translationTargetTitle">译文</strong>
+                <button id="translationCopyButton" type="button" disabled>复制</button>
+              </header>
+              <div class="translation-output" id="translationOutputText"><span>选择文本或载入当前文件后开始翻译。</span></div>
+            </section>
+          </div>
+          <div class="translation-status" id="translationStatus" role="status" aria-live="polite"></div>
         </div>
       </section>
 

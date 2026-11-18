@@ -125,6 +125,19 @@ const elements = {
   homeShareButton: document.querySelector('#homeShareButton'),
   homeThemeButton: document.querySelector('#homeThemeButton'),
   hostProjectActions: document.querySelector('#hostProjectActions'),
+  inlineEditApplyButton: document.querySelector('#inlineEditApplyButton'),
+  inlineEditCancelButton: document.querySelector('#inlineEditCancelButton'),
+  inlineEditForm: document.querySelector('#inlineEditForm'),
+  inlineEditLauncher: document.querySelector('#inlineEditLauncher'),
+  inlineEditOriginal: document.querySelector('#inlineEditOriginal'),
+  inlineEditPopover: document.querySelector('#inlineEditPopover'),
+  inlineEditPreview: document.querySelector('#inlineEditPreview'),
+  inlineEditPrompt: document.querySelector('#inlineEditPrompt'),
+  inlineEditProposed: document.querySelector('#inlineEditProposed'),
+  inlineEditRunButton: document.querySelector('#inlineEditRunButton'),
+  inlineEditSelectionMeta: document.querySelector('#inlineEditSelectionMeta'),
+  inlineEditStatus: document.querySelector('#inlineEditStatus'),
+  inlineEditStopButton: document.querySelector('#inlineEditStopButton'),
   localModeBadge: document.querySelector('#localModeBadge'),
   localModeLabel: document.querySelector('#localModeLabel'),
   logPanel: document.querySelector('#logPanel'),
@@ -178,6 +191,19 @@ const elements = {
   sidebarModeLabel: document.querySelector('#sidebarModeLabel'),
   sourceToPdfButton: document.querySelector('#sourceToPdfButton'),
   toast: document.querySelector('#toast'),
+  translationCopyButton: document.querySelector('#translationCopyButton'),
+  translationLanguageSelect: document.querySelector('#translationLanguageSelect'),
+  translationOutputText: document.querySelector('#translationOutputText'),
+  translationPanel: document.querySelector('#translationPanel'),
+  translationRefreshButton: document.querySelector('#translationRefreshButton'),
+  translationRunButton: document.querySelector('#translationRunButton'),
+  translationSourceLanguage: document.querySelector('#translationSourceLanguage'),
+  translationSourceMeta: document.querySelector('#translationSourceMeta'),
+  translationSourceText: document.querySelector('#translationSourceText'),
+  translationStatus: document.querySelector('#translationStatus'),
+  translationStopButton: document.querySelector('#translationStopButton'),
+  translationTab: document.querySelector('#translationTab'),
+  translationTargetTitle: document.querySelector('#translationTargetTitle'),
   uploadButton: document.querySelector('#uploadButton'),
   uploadInput: document.querySelector('#uploadInput'),
   currentProjectName: document.querySelector('#currentProjectName'),
@@ -271,6 +297,31 @@ const codexState = {
   models: [],
   modelsLoaded: false,
   modelsLoading: false,
+};
+const inlineEditState = {
+  active: false,
+  running: false,
+  runId: '',
+  requestToken: 0,
+  filePath: '',
+  original: '',
+  proposed: '',
+  startAnchor: null,
+  endAnchor: null,
+  rangeStart: null,
+  rangeEnd: null,
+};
+const translationState = {
+  running: false,
+  runId: '',
+  requestToken: 0,
+  source: '',
+  sourceMode: '',
+  sourcePath: '',
+  sourceStartLine: 0,
+  sourceEndLine: 0,
+  sourceLanguage: '',
+  output: '',
 };
 const CODEX_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const CODEX_REASONING_LABELS = Object.freeze({
@@ -422,6 +473,11 @@ function initializeCodeEditor() {
     name: 'localtexToggleWrap',
     bindKey: { win: 'Alt-Z', mac: 'Alt-Z' },
     exec: () => toggleEditorWrap(),
+  });
+  editor.commands.addCommand({
+    name: 'localtexInlineEdit',
+    bindKey: { win: 'Ctrl-K', mac: 'Command-K' },
+    exec: () => openInlineEdit(),
   });
 
   return editor;
@@ -583,6 +639,352 @@ function toggleEditorWrap() {
   editorView.wrap = !editorView.wrap;
   applyEditorView();
   saveEditorView();
+}
+
+function syncTextTaskControls() {
+  const canUse = Boolean(state.config?.codex?.canUse);
+  const inlineBlocked = !canUse || codexState.running || translationState.running;
+  const translationBlocked = !canUse || codexState.running || inlineEditState.running;
+  const chatBlocked = inlineEditState.running || translationState.running;
+
+  elements.codexSendButton.disabled = !canUse || codexState.running || chatBlocked;
+  elements.codexNewThreadButton.disabled = codexState.running || chatBlocked;
+  elements.codexModelSelect.disabled = codexState.running || chatBlocked || codexState.modelsLoading || !canUse;
+  elements.codexReasoningSelect.disabled = codexState.running || chatBlocked || codexState.modelsLoading || !canUse;
+  elements.codexPermissionSelect.disabled = codexState.running || chatBlocked || !canUse;
+
+  elements.inlineEditRunButton.disabled = inlineEditState.running || inlineBlocked;
+  elements.inlineEditStopButton.disabled = !inlineEditState.running;
+  elements.translationRunButton.disabled = translationState.running || translationBlocked || !translationState.source;
+  elements.translationRefreshButton.disabled = translationState.running;
+  elements.translationStopButton.disabled = !translationState.running;
+  elements.translationLanguageSelect.disabled = translationState.running;
+  elements.translationCopyButton.disabled = !translationState.output;
+}
+
+function aceRangeFromPositions(start, end) {
+  const Range = window.ace.require('ace/range').Range;
+  return new Range(start.row, start.column, end.row, end.column);
+}
+
+function extractTextTaskResult(value) {
+  let text = String(value || '').replace(/^\uFEFF/, '');
+  const fenced = text.match(/^\s*```(?:latex|tex|markdown|md|text)?[^\n]*\r?\n([\s\S]*?)\r?\n```\s*$/i);
+  if (fenced) text = fenced[1];
+  return text;
+}
+
+async function waitForTextTask(runId, options = {}) {
+  const onStatus = typeof options.onStatus === 'function' ? options.onStatus : () => {};
+  const onText = typeof options.onText === 'function' ? options.onText : () => {};
+  const timeout = Number(options.timeout) || 10 * 60 * 1000;
+  const startedAt = Date.now();
+  let after = 0;
+  let latestText = '';
+
+  while (Date.now() - startedAt < timeout) {
+    const snapshot = await api(`/api/codex/runs/${encodeURIComponent(runId)}?after=${after}`);
+    for (const event of snapshot.events || []) {
+      after = Math.max(after, Number(event.sequence) || after);
+      if (event.type === 'status' && event.message) onStatus(event.message);
+      if (event.type === 'assistant' && event.text) {
+        latestText = event.text;
+        onText(extractTextTaskResult(latestText));
+      }
+      if (event.type === 'done' || event.type === 'error') {
+        const finalText = extractTextTaskResult(event.finalAssistant?.text || latestText);
+        if (event.type === 'done' && event.status !== 'cancelled') {
+          return { text: finalText, event };
+        }
+        const error = new Error(event.message || (event.status === 'cancelled' ? '任务已停止。' : 'Codex 任务失败。'));
+        error.cancelled = event.status === 'cancelled';
+        throw error;
+      }
+    }
+    after = Math.max(after, Number(snapshot.lastSequence) || after);
+    await new Promise((resolve) => setTimeout(resolve, 650));
+  }
+  throw new Error('Codex 文本任务等待超时。');
+}
+
+async function cancelTextTaskRun(runId) {
+  if (!runId) return;
+  await api(`/api/codex/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }).catch(() => {});
+}
+
+function setInlineEditStatus(message = '', error = false) {
+  elements.inlineEditStatus.textContent = message;
+  elements.inlineEditStatus.classList.toggle('error', error);
+  elements.inlineEditStatus.classList.toggle('running', inlineEditState.running && !error);
+}
+
+function setInlineEditRunning(running, message = '') {
+  inlineEditState.running = running;
+  elements.inlineEditPopover.classList.toggle('running', running);
+  elements.inlineEditStopButton.hidden = !running;
+  elements.inlineEditApplyButton.hidden = running || !inlineEditState.proposed;
+  elements.inlineEditRunButton.textContent = inlineEditState.proposed ? '重新生成' : '生成修改';
+  if (message) setInlineEditStatus(message);
+  syncTextTaskControls();
+}
+
+function editorPointForPosition(position) {
+  const coordinates = codeEditor.renderer.textToScreenCoordinates(position.row, position.column);
+  const bounds = elements.editorSurface.getBoundingClientRect();
+  return {
+    x: Number(coordinates?.pageX || bounds.left) - bounds.left,
+    y: Number(coordinates?.pageY || bounds.top) - bounds.top,
+  };
+}
+
+function hideInlineEditLauncher() {
+  elements.inlineEditLauncher.hidden = true;
+}
+
+function positionInlineEditLauncher() {
+  if (
+    inlineEditState.active
+    || !state.activePath
+    || !codeEditor.getSelectedText().trim()
+  ) {
+    hideInlineEditLauncher();
+    return;
+  }
+  const range = codeEditor.getSelectionRange();
+  const point = editorPointForPosition(range.end);
+  const bounds = elements.editorSurface.getBoundingClientRect();
+  const buttonWidth = elements.inlineEditLauncher.offsetWidth || 65;
+  const buttonHeight = elements.inlineEditLauncher.offsetHeight || 29;
+  elements.inlineEditLauncher.style.left = `${clamp(point.x - buttonWidth / 2, 6, bounds.width - buttonWidth - 6)}px`;
+  elements.inlineEditLauncher.style.top = `${clamp(
+    point.y + Math.max(4, codeEditor.renderer.lineHeight - 3),
+    6,
+    bounds.height - buttonHeight - 6,
+  )}px`;
+  elements.inlineEditLauncher.hidden = false;
+}
+
+function scheduleInlineEditLauncherPosition() {
+  requestAnimationFrame(positionInlineEditLauncher);
+}
+
+function positionInlineEditPopover() {
+  if (!inlineEditState.active || elements.inlineEditPopover.hidden) return;
+  const endPoint = editorPointForPosition(inlineEditState.rangeEnd);
+  const startPoint = editorPointForPosition(inlineEditState.rangeStart);
+  const bounds = elements.editorSurface.getBoundingClientRect();
+  const width = elements.inlineEditPopover.offsetWidth || 430;
+  const height = elements.inlineEditPopover.offsetHeight || 280;
+  const left = clamp(endPoint.x - width / 2, 6, bounds.width - width - 6);
+  let top = endPoint.y + codeEditor.renderer.lineHeight + 8;
+  if (top + height > bounds.height - 6) top = startPoint.y - height - 8;
+  elements.inlineEditPopover.style.left = `${left}px`;
+  elements.inlineEditPopover.style.top = `${clamp(top, 6, bounds.height - height - 6)}px`;
+}
+
+function detachInlineEditAnchors() {
+  inlineEditState.startAnchor?.detach?.();
+  inlineEditState.endAnchor?.detach?.();
+  inlineEditState.startAnchor = null;
+  inlineEditState.endAnchor = null;
+}
+
+function currentInlineEditRange() {
+  if (!inlineEditState.startAnchor || !inlineEditState.endAnchor) return null;
+  return aceRangeFromPositions(
+    inlineEditState.startAnchor.getPosition(),
+    inlineEditState.endAnchor.getPosition(),
+  );
+}
+
+function selectedRangeMeta(range) {
+  const startLine = range.start.row + 1;
+  const endLine = range.end.row + 1;
+  const lineLabel = startLine === endLine ? `第 ${startLine} 行` : `第 ${startLine}–${endLine} 行`;
+  return `${lineLabel} · ${codeEditor.session.getTextRange(range).length} 字符`;
+}
+
+function openInlineEdit(presetPrompt = '') {
+  if (inlineEditState.active) {
+    elements.inlineEditPrompt.focus();
+    return;
+  }
+  if (!state.activeProject || !state.activePath) {
+    showToast('请先打开一个文本文件。', true);
+    return;
+  }
+  if (!state.config?.codex?.canUse) {
+    showToast('行内修改只允许 LocalTeX 主机使用。', true);
+    return;
+  }
+  if (codexState.running || translationState.running) {
+    showToast('另一个 Codex 文本任务正在运行，请稍后再试。', true);
+    return;
+  }
+  const range = codeEditor.getSelectionRange();
+  const original = codeEditor.session.getTextRange(range);
+  if (!original.trim()) {
+    showToast('请先选中需要修改的 LaTeX 内容。', true);
+    return;
+  }
+  if (original.length > 40_000) {
+    showToast('选区超过 40,000 字符，请缩小范围后再修改。', true);
+    return;
+  }
+
+  hideInlineEditLauncher();
+  detachInlineEditAnchors();
+  inlineEditState.active = true;
+  inlineEditState.running = false;
+  inlineEditState.runId = '';
+  inlineEditState.requestToken += 1;
+  inlineEditState.filePath = state.activePath;
+  inlineEditState.original = original;
+  inlineEditState.proposed = '';
+  inlineEditState.rangeStart = { row: range.start.row, column: range.start.column };
+  inlineEditState.rangeEnd = { row: range.end.row, column: range.end.column };
+  inlineEditState.startAnchor = codeEditor.session.doc.createAnchor(range.start.row, range.start.column);
+  inlineEditState.endAnchor = codeEditor.session.doc.createAnchor(range.end.row, range.end.column);
+
+  elements.inlineEditPreview.hidden = true;
+  elements.inlineEditApplyButton.hidden = true;
+  elements.inlineEditRunButton.textContent = '生成修改';
+  elements.inlineEditSelectionMeta.textContent = selectedRangeMeta(range);
+  elements.inlineEditPrompt.value = String(presetPrompt || '');
+  elements.inlineEditPopover.hidden = false;
+  setInlineEditStatus('选区已锁定；生成后可检查并应用替换。');
+  syncTextTaskControls();
+  requestAnimationFrame(() => {
+    positionInlineEditPopover();
+    elements.inlineEditPrompt.focus();
+    elements.inlineEditPrompt.select();
+  });
+}
+
+function closeInlineEdit(restoreFocus = true, cancelRun = true) {
+  if (!inlineEditState.active) return;
+  inlineEditState.requestToken += 1;
+  if (cancelRun && inlineEditState.runId) void cancelTextTaskRun(inlineEditState.runId);
+  inlineEditState.active = false;
+  inlineEditState.running = false;
+  inlineEditState.runId = '';
+  inlineEditState.original = '';
+  inlineEditState.proposed = '';
+  inlineEditState.filePath = '';
+  inlineEditState.rangeStart = null;
+  inlineEditState.rangeEnd = null;
+  detachInlineEditAnchors();
+  elements.inlineEditPopover.hidden = true;
+  elements.inlineEditPreview.hidden = true;
+  elements.inlineEditApplyButton.hidden = true;
+  elements.inlineEditStopButton.hidden = true;
+  elements.inlineEditPrompt.value = '';
+  setInlineEditStatus('');
+  syncTextTaskControls();
+  scheduleInlineEditLauncherPosition();
+  if (restoreFocus) codeEditor.focus();
+}
+
+async function runInlineEdit() {
+  if (!inlineEditState.active || inlineEditState.running) return;
+  if (!state.config?.codex?.canUse) {
+    setInlineEditStatus('Codex 当前不可用。', true);
+    return;
+  }
+  const prompt = elements.inlineEditPrompt.value.trim();
+  if (!prompt) {
+    setInlineEditStatus('请输入修改要求。', true);
+    elements.inlineEditPrompt.focus();
+    return;
+  }
+  if (codexState.running || translationState.running) {
+    setInlineEditStatus('另一个 Codex 文本任务正在运行，请稍后再试。', true);
+    return;
+  }
+
+  const token = ++inlineEditState.requestToken;
+  inlineEditState.proposed = '';
+  elements.inlineEditPreview.hidden = true;
+  elements.inlineEditApplyButton.hidden = true;
+  setInlineEditRunning(true, 'Codex 正在生成替换内容…');
+  try {
+    const result = await api('/api/codex/runs', {
+      method: 'POST',
+      body: JSON.stringify({
+        taskKind: 'inline-edit',
+        prompt,
+        activeFile: state.activePath || '',
+        mainFile: state.mainDocument || '',
+        includeSelection: true,
+        selection: inlineEditState.original,
+        selectionStartLine: inlineEditState.rangeStart.row + 1,
+        selectionEndLine: inlineEditState.rangeEnd.row + 1,
+        includeCurrentFile: false,
+      }),
+    });
+    if (token !== inlineEditState.requestToken) return;
+    inlineEditState.runId = result.run.id;
+    const generated = await waitForTextTask(result.run.id, {
+      onStatus: (message) => {
+        if (token === inlineEditState.requestToken) setInlineEditStatus(message);
+      },
+      onText: (text) => {
+        if (token === inlineEditState.requestToken && text.trim()) {
+          setInlineEditStatus('正在接收修改内容…');
+        }
+      },
+    });
+    if (token !== inlineEditState.requestToken) return;
+    const proposed = generated.text;
+    if (!proposed.trim()) throw new Error('Codex 没有返回可应用的修改。');
+    inlineEditState.proposed = proposed;
+    elements.inlineEditOriginal.textContent = inlineEditState.original;
+    elements.inlineEditProposed.textContent = proposed;
+    elements.inlineEditPreview.hidden = false;
+    elements.inlineEditApplyButton.hidden = false;
+    elements.inlineEditRunButton.textContent = '重新生成';
+    setInlineEditStatus(`修改已生成 · ${inlineEditState.original.length} → ${proposed.length} 字符`);
+    syncTextTaskControls();
+    requestAnimationFrame(positionInlineEditPopover);
+  } catch (error) {
+    if (token !== inlineEditState.requestToken) return;
+    setInlineEditStatus(error.cancelled ? '已停止生成。' : error.message, !error.cancelled);
+  } finally {
+    if (token === inlineEditState.requestToken) {
+      inlineEditState.runId = '';
+      setInlineEditRunning(false);
+      setInlineEditStatus(elements.inlineEditStatus.textContent, elements.inlineEditStatus.classList.contains('error'));
+    }
+  }
+}
+
+function applyInlineEdit() {
+  if (!inlineEditState.active || !inlineEditState.proposed) return;
+  if (state.activePath !== inlineEditState.filePath) {
+    setInlineEditStatus('当前文件已经切换，无法应用这次修改。', true);
+    return;
+  }
+  const range = currentInlineEditRange();
+  if (!range) {
+    setInlineEditStatus('原选区已失效，请重新选择后生成。', true);
+    return;
+  }
+  const currentText = codeEditor.session.getTextRange(range);
+  if (currentText !== inlineEditState.original) {
+    setInlineEditStatus('原选区内容已发生变化，请取消后重新选择，避免覆盖新的编辑。', true);
+    return;
+  }
+
+  const start = { row: range.start.row, column: range.start.column };
+  const lines = inlineEditState.proposed.split(/\r\n|\r|\n/);
+  const end = lines.length === 1
+    ? { row: start.row, column: start.column + lines[0].length }
+    : { row: start.row + lines.length - 1, column: lines.at(-1).length };
+  codeEditor.session.replace(range, inlineEditState.proposed);
+  codeEditor.selection.setSelectionRange(aceRangeFromPositions(start, end));
+  codeEditor.scrollToLine(start.row, true, true);
+  closeInlineEdit(true, false);
+  showToast('已应用行内修改；可用 Ctrl/⌘+Z 撤销。');
 }
 
 function loadPanelLayout() {
@@ -911,6 +1313,10 @@ function finishPanelResize(event) {
   };
   savePanelLayout();
   updateResizerAccessibility(sizes);
+  requestAnimationFrame(() => {
+    if (inlineEditState.active) positionInlineEditPopover();
+    else scheduleInlineEditLauncherPosition();
+  });
 }
 
 function startPanelResize(event, kind) {
@@ -1641,6 +2047,8 @@ async function loadProjects() {
 
 function resetEditorState() {
   stopDocumentCollaboration();
+  closeInlineEdit(false);
+  resetTranslationState();
   clearSourceSyncMarker();
   closeEditorFindbar(false);
   state.files = [];
@@ -1750,6 +2158,8 @@ async function removeProject(project) {
 async function showProjectHome() {
   if (!await confirmDiscard()) return;
   await stopCodexRun(true);
+  closeInlineEdit(false);
+  resetTranslationState();
   closeEditorFindbar(false);
   unloadCodexHistory();
   stopDocumentCollaboration();
@@ -2251,6 +2661,10 @@ async function openFile(file, force = false, revealInTree = true, selectForCompi
   }
 
   if (!force && file.path !== state.activePath && !await confirmDiscard()) return false;
+  if (file.path !== state.activePath) {
+    closeInlineEdit(false);
+    resetTranslationState();
+  }
   clearSourceSyncMarker();
   stopDocumentCollaboration();
 
@@ -2336,6 +2750,7 @@ function updateCodexAvailability(config = state.config?.codex) {
   updateCodexCollapseUi(panelLayout.preferred?.codexCollapsed === true);
   requestAnimationFrame(restorePanelLayout);
   updateCodexContext();
+  syncTextTaskControls();
   if (available && !codexState.modelsLoaded && !codexState.modelsLoading) {
     loadCodexModels().catch(() => {});
   }
@@ -2624,6 +3039,7 @@ function setCodexRunning(running, message = '') {
   if (running) showCodexThinking(message || 'Codex 正在思考…');
   else hideCodexThinking();
   if (message) elements.codexRunStatus.textContent = message;
+  syncTextTaskControls();
   renderCodexHistoryList();
 }
 
@@ -3383,6 +3799,10 @@ async function sendCodexPrompt(promptOverride = '') {
     return false;
   }
   if (!prompt || codexState.running) return false;
+  if (inlineEditState.running || translationState.running) {
+    showToast('请先等待当前的文本任务结束。', true);
+    return false;
+  }
 
   if (state.dirty && !await saveFile(true)) return false;
   const selection = codeEditor.getSelectedText();
@@ -3459,8 +3879,7 @@ function handleCodexQuickAction(action) {
       showToast('请先在编辑器中选中需要修改的内容。', true);
       return;
     }
-    elements.codexSelectionContext.checked = true;
-    sendCodexPrompt('请润色选中的论文内容，保留原有 LaTeX 命令、引用和数学表达，并说明主要修改。');
+    openInlineEdit('润色这段学术表达，保持原意、引用、数学表达和 LaTeX 结构。');
     return;
   }
   if (action === 'review') {
@@ -3474,17 +3893,246 @@ function handleCodexQuickAction(action) {
 }
 
 function switchPreview(tab) {
-  const activeTab = tab === 'log' ? 'log' : 'pdf';
+  const activeTab = tab === 'log' || tab === 'translation' ? tab : 'pdf';
   const visibility = {
     pdf: activeTab === 'pdf',
     log: activeTab === 'log',
+    translation: activeTab === 'translation',
   };
   elements.pdfPanel.hidden = !visibility.pdf;
   elements.logPanel.hidden = !visibility.log;
+  elements.translationPanel.hidden = !visibility.translation;
   elements.pdfTab.classList.toggle('active', visibility.pdf);
   elements.logTab.classList.toggle('active', visibility.log);
+  elements.translationTab.classList.toggle('active', visibility.translation);
   elements.pdfTab.setAttribute('aria-selected', String(visibility.pdf));
   elements.logTab.setAttribute('aria-selected', String(visibility.log));
+  elements.translationTab.setAttribute('aria-selected', String(visibility.translation));
+  if (visibility.translation) loadTranslationSource({ preserveOutput: true });
+}
+
+function detectTextLanguage(text) {
+  const source = String(text || '')
+    .replace(/%.*$/gm, ' ')
+    .replace(/\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\$[^$]*\$/g, ' ')
+    .replace(/\\[A-Za-z@]+\*?(?:\[[^\]]*\])?(?:\{[^{}]*\})?/g, ' ')
+    .replace(/\\(?:begin|end)\{[^}]+\}/g, ' ');
+  const cjkCount = source.match(/\p{Script=Han}/gu)?.length || 0;
+  const latinCount = source.match(/[A-Za-z]/g)?.length || 0;
+  if (cjkCount >= 2 && cjkCount * 2 >= Math.max(1, latinCount)) return 'zh';
+  if (latinCount) return 'en';
+  return cjkCount ? 'zh' : '';
+}
+
+function selectedTranslationTarget(choice = elements.translationLanguageSelect.value) {
+  if (choice === 'zh-en') return 'en';
+  if (choice === 'en-zh') return 'zh';
+  return translationState.sourceLanguage === 'zh' ? 'en' : 'zh';
+}
+
+function updateTranslationDirection() {
+  const target = selectedTranslationTarget();
+  elements.translationTargetTitle.textContent = target === 'en' ? '英文译文' : '中文译文';
+  elements.translationSourceLanguage.textContent = translationState.sourceLanguage === 'zh'
+    ? '中文'
+    : translationState.sourceLanguage === 'en'
+      ? 'English'
+      : '自动识别';
+}
+
+function setTranslationStatus(message = '', error = false) {
+  elements.translationStatus.textContent = message;
+  elements.translationStatus.classList.toggle('error', error);
+}
+
+function renderTranslationOutput(text = '', loading = false) {
+  elements.translationOutputText.replaceChildren();
+  elements.translationOutputText.classList.toggle('loading', loading);
+  if (text) {
+    elements.translationOutputText.textContent = text;
+  } else {
+    const empty = document.createElement('span');
+    empty.textContent = loading ? 'Codex 正在翻译…' : '选择文本或载入当前文件后开始翻译。';
+    elements.translationOutputText.append(empty);
+  }
+}
+
+function setTranslationRunning(running, message = '') {
+  translationState.running = running;
+  elements.translationStopButton.hidden = !running;
+  renderTranslationOutput(translationState.output, running && !translationState.output);
+  if (message) setTranslationStatus(message);
+  syncTextTaskControls();
+}
+
+function loadTranslationSource(options = {}) {
+  if (translationState.running) return false;
+  const selection = codeEditor.getSelectedText();
+  const range = codeEditor.getSelectionRange();
+  const hasSelection = Boolean(selection.trim());
+  const source = hasSelection ? selection : codeEditor.getValue();
+  const sourceMode = hasSelection ? 'selection' : 'file';
+  const sourcePath = state.activePath || '';
+  const previousSource = translationState.source;
+  const previousMode = translationState.sourceMode;
+  const previousPath = translationState.sourcePath;
+
+  translationState.source = source;
+  translationState.sourceMode = source ? sourceMode : '';
+  translationState.sourcePath = sourcePath;
+  translationState.sourceStartLine = hasSelection ? range.start.row + 1 : 1;
+  translationState.sourceEndLine = hasSelection ? range.end.row + 1 : codeEditor.session.getLength();
+  translationState.sourceLanguage = detectTextLanguage(source);
+  const sourceChanged = source !== previousSource || sourceMode !== previousMode || sourcePath !== previousPath;
+  if (!options.preserveOutput || sourceChanged) {
+    translationState.output = '';
+    renderTranslationOutput();
+  }
+
+  elements.translationSourceText.textContent = source || '尚未载入文本。';
+  if (source) {
+    const lineLabel = translationState.sourceStartLine === translationState.sourceEndLine
+      ? `第 ${translationState.sourceStartLine} 行`
+      : `第 ${translationState.sourceStartLine}–${translationState.sourceEndLine} 行`;
+    elements.translationSourceMeta.textContent = sourceMode === 'selection'
+      ? `选区 · ${lineLabel} · ${sourcePath.split('/').at(-1)}`
+      : `全文 · ${sourcePath.split('/').at(-1)}`;
+  } else {
+    elements.translationSourceMeta.textContent = '没有可翻译的文本';
+  }
+  updateTranslationDirection();
+  setTranslationStatus(source ? `${source.length.toLocaleString('zh-CN')} 字符` : '请先打开一个文本文件。');
+  syncTextTaskControls();
+  if (options.notify) showToast(source ? '已载入当前文本。' : '当前没有可翻译的文本。', !source);
+  return Boolean(source);
+}
+
+function resetTranslationState(cancelRun = true) {
+  translationState.requestToken += 1;
+  if (cancelRun && translationState.runId) void cancelTextTaskRun(translationState.runId);
+  translationState.running = false;
+  translationState.runId = '';
+  translationState.source = '';
+  translationState.sourceMode = '';
+  translationState.sourcePath = '';
+  translationState.sourceStartLine = 0;
+  translationState.sourceEndLine = 0;
+  translationState.sourceLanguage = '';
+  translationState.output = '';
+  elements.translationSourceText.textContent = '';
+  elements.translationSourceMeta.textContent = '尚未载入文本';
+  elements.translationSourceLanguage.textContent = '—';
+  elements.translationTargetTitle.textContent = '译文';
+  elements.translationStopButton.hidden = true;
+  renderTranslationOutput();
+  setTranslationStatus('');
+  syncTextTaskControls();
+}
+
+async function runTranslation() {
+  if (translationState.running) return;
+  if (!state.config?.codex?.canUse) {
+    showToast('中英对照翻译只允许 LocalTeX 主机使用。', true);
+    return;
+  }
+  if (codexState.running || inlineEditState.running) {
+    showToast('另一个 Codex 文本任务正在运行，请稍后再试。', true);
+    return;
+  }
+  if (!loadTranslationSource()) {
+    showToast('请先选择文本或打开一个文本文件。', true);
+    return;
+  }
+  if (translationState.source.length > 120_000) {
+    setTranslationStatus('文本超过 120,000 字符，请选择较小范围后重试。', true);
+    return;
+  }
+
+  const token = ++translationState.requestToken;
+  const targetLanguage = selectedTranslationTarget();
+  translationState.output = '';
+  renderTranslationOutput('', true);
+  setTranslationRunning(true, 'Codex 正在翻译…');
+  try {
+    const result = await api('/api/codex/runs', {
+      method: 'POST',
+      body: JSON.stringify({
+        taskKind: 'translation',
+        prompt: '翻译当前文本。',
+        activeFile: translationState.sourcePath,
+        mainFile: state.mainDocument || '',
+        includeSelection: translationState.sourceMode === 'selection',
+        selection: translationState.sourceMode === 'selection' ? translationState.source : '',
+        selectionStartLine: translationState.sourceStartLine,
+        selectionEndLine: translationState.sourceEndLine,
+        includeCurrentFile: translationState.sourceMode === 'file',
+        translationTarget: targetLanguage,
+      }),
+    });
+    if (token !== translationState.requestToken) return;
+    translationState.runId = result.run.id;
+    const generated = await waitForTextTask(result.run.id, {
+      onStatus: (message) => {
+        if (token === translationState.requestToken) setTranslationStatus(message);
+      },
+      onText: (text) => {
+        if (token !== translationState.requestToken || !text) return;
+        translationState.output = text;
+        renderTranslationOutput(text, true);
+      },
+    });
+    if (token !== translationState.requestToken) return;
+    translationState.output = generated.text;
+    renderTranslationOutput(generated.text);
+    setTranslationStatus(`翻译完成 · ${generated.text.length.toLocaleString('zh-CN')} 字符`);
+    syncTextTaskControls();
+  } catch (error) {
+    if (token !== translationState.requestToken) return;
+    if (error.cancelled) {
+      renderTranslationOutput(translationState.output);
+      setTranslationStatus('翻译已停止。');
+    } else {
+      renderTranslationOutput(translationState.output);
+      setTranslationStatus(error.message, true);
+    }
+  } finally {
+    if (token === translationState.requestToken) {
+      translationState.runId = '';
+      setTranslationRunning(false);
+      setTranslationStatus(
+        elements.translationStatus.textContent,
+        elements.translationStatus.classList.contains('error'),
+      );
+    }
+  }
+}
+
+async function stopTranslation() {
+  if (!translationState.runId || !translationState.running) return;
+  setTranslationStatus('正在停止翻译…');
+  await cancelTextTaskRun(translationState.runId);
+}
+
+async function copyTranslation() {
+  if (!translationState.output) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(translationState.output);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = translationState.output;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.append(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      if (!copied) throw new Error('浏览器未允许写入剪贴板。');
+    }
+    showToast('译文已复制。');
+  } catch (error) {
+    showToast(`复制失败：${error.message}`, true);
+  }
 }
 
 function renderDiagnostics(diagnostics = []) {
@@ -4433,8 +5081,11 @@ codeEditor.session.on('change', () => {
 codeEditor.selection.on('changeCursor', updateCursorPosition);
 codeEditor.selection.on('changeSelection', () => {
   updateCodexContext();
+  scheduleInlineEditLauncherPosition();
   if (!elements.editorFindbar.hidden) updateEditorFindCount();
 });
+codeEditor.session.on('changeScrollTop', hideInlineEditLauncher);
+codeEditor.session.on('changeScrollLeft', hideInlineEditLauncher);
 codeEditor.on('click', (event) => {
   const domEvent = event.domEvent;
   if (
@@ -4450,6 +5101,35 @@ codeEditor.on('click', (event) => {
 elements.fontDecreaseButton.addEventListener('click', () => changeEditorFontSize(-1));
 elements.fontIncreaseButton.addEventListener('click', () => changeEditorFontSize(1));
 elements.wrapButton.addEventListener('click', toggleEditorWrap);
+elements.inlineEditLauncher.addEventListener('click', () => openInlineEdit());
+elements.inlineEditForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  runInlineEdit();
+});
+elements.inlineEditPrompt.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeInlineEdit();
+    return;
+  }
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+    event.preventDefault();
+    runInlineEdit();
+  }
+});
+for (const button of elements.inlineEditPopover.querySelectorAll('[data-inline-preset]')) {
+  button.addEventListener('click', () => {
+    elements.inlineEditPrompt.value = button.dataset.inlinePreset || '';
+    elements.inlineEditPrompt.focus();
+  });
+}
+elements.inlineEditCancelButton.addEventListener('click', () => closeInlineEdit());
+elements.inlineEditApplyButton.addEventListener('click', applyInlineEdit);
+elements.inlineEditStopButton.addEventListener('click', async () => {
+  if (!inlineEditState.runId) return;
+  setInlineEditStatus('正在停止 Codex…');
+  await cancelTextTaskRun(inlineEditState.runId);
+});
 elements.editorFindInput.addEventListener('input', () => findEditorMatch(false, false));
 elements.editorFindInput.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
@@ -4496,6 +5176,18 @@ elements.uploadInput.addEventListener('change', async () => {
 });
 elements.pdfTab.addEventListener('click', () => switchPreview('pdf'));
 elements.logTab.addEventListener('click', () => switchPreview('log'));
+elements.translationTab.addEventListener('click', () => switchPreview('translation'));
+elements.translationRefreshButton.addEventListener('click', () => loadTranslationSource({ notify: true }));
+elements.translationRunButton.addEventListener('click', runTranslation);
+elements.translationStopButton.addEventListener('click', stopTranslation);
+elements.translationCopyButton.addEventListener('click', copyTranslation);
+elements.translationLanguageSelect.addEventListener('change', () => {
+  translationState.output = '';
+  renderTranslationOutput();
+  updateTranslationDirection();
+  setTranslationStatus('翻译方向已更改。');
+  syncTextTaskControls();
+});
 elements.codexComposer.addEventListener('submit', (event) => {
   event.preventDefault();
   sendCodexPrompt();
@@ -4645,7 +5337,24 @@ elements.collaborationButton.addEventListener('click', () => {
   if (name) updateCollaboratorName(name);
 });
 
+document.addEventListener('pointerdown', (event) => {
+  if (!inlineEditState.active) return;
+  if (elements.inlineEditPopover.contains(event.target) || elements.inlineEditLauncher.contains(event.target)) return;
+  closeInlineEdit(false);
+});
+
+window.addEventListener('resize', () => {
+  if (inlineEditState.active) requestAnimationFrame(positionInlineEditPopover);
+  else scheduleInlineEditLauncherPosition();
+});
+
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && inlineEditState.active) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeInlineEdit();
+    return;
+  }
   if (event.key === 'Escape' && pdfAnnotationState.active) {
     event.preventDefault();
     event.stopPropagation();

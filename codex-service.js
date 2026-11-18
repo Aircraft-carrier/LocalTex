@@ -17,6 +17,8 @@ const MAX_MODEL_ID = 160;
 const THREAD_TURN_PAGE_SIZE = 50;
 const MAX_THREAD_TURNS = 200;
 const reasoningEfforts = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const textTaskKinds = new Set(['inline-edit', 'translation']);
+const translationTargets = new Set(['auto', 'zh', 'en']);
 const visibleThreadSourceKinds = Object.freeze([
   'cli',
   'vscode',
@@ -373,6 +375,55 @@ function buildPrompt(context, permissionMode = 'read-only') {
   return sections.join('\n\n---\n\n');
 }
 
+function normalizedTaskKind(value) {
+  const taskKind = String(value || 'chat').trim() || 'chat';
+  if (taskKind !== 'chat' && !textTaskKinds.has(taskKind)) throw new Error('Codex 文本任务类型无效。');
+  return taskKind;
+}
+
+function normalizedTranslationTarget(value) {
+  const target = String(value || 'auto').trim() || 'auto';
+  if (!translationTargets.has(target)) throw new Error('翻译目标语言无效。');
+  return target;
+}
+
+function buildTextTaskPrompt(context, taskKind) {
+  const source = context.selection || context.activeFileContent;
+  if (!source.trim()) throw new Error('没有可供 Codex 处理的文本。');
+
+  if (taskKind === 'inline-edit') {
+    return [
+      '你是 LocalTeX 的 LaTeX 行内编辑引擎。这次任务是在表单中完成一次精确的选区替换。',
+      '只输出可以直接替换原选区的完整 LaTeX 源码。',
+      '不要使用 Markdown 代码围栏，不要添加说明、标题、引号或“修改后：”等前缀。',
+      '保留选区应有的缩进、换行、LaTeX 命令、引用、标签、数学公式和注释语义。',
+      '除非编辑指令明确要求，否则不要改动未被选中的内容。',
+      `当前文件：${context.activeFile || '未选择'}`,
+      `编辑指令：\n${boundedText(context.prompt, MAX_USER_PROMPT)}`,
+      `需要替换的原始选区：\n${boundedText(source, MAX_SELECTION)}`,
+    ].join('\n\n---\n\n');
+  }
+
+  if (taskKind === 'translation') {
+    const targetInstruction = context.translationTarget === 'zh'
+      ? '将源文本翻译为简体中文。'
+      : context.translationTarget === 'en'
+        ? '将源文本翻译为英文。'
+        : '自动判断源文本的主要语言：中文翻译为英文，其他语言翻译为简体中文。';
+    return [
+      '你是 LocalTeX 的学术中英对照翻译引擎。',
+      '只输出译文，不要使用 Markdown 代码围栏，不要解释翻译过程，不要重复原文。',
+      targetInstruction,
+      '保留原有 LaTeX 文档结构、命令、环境、标签、引用键、文件路径、网址和数学公式；只翻译自然语言正文。',
+      '尽量保持段落、列表、标题和换行与原文一一对应，便于中英对照阅读。',
+      `当前文件：${context.activeFile || '未选择'}`,
+      `源文本：\n${boundedText(source, MAX_ACTIVE_FILE)}`,
+    ].join('\n\n---\n\n');
+  }
+
+  return buildPrompt(context, 'read-only');
+}
+
 class CodexService {
   constructor(options = {}) {
     this.clientPromise = null;
@@ -635,8 +686,11 @@ class CodexService {
     const prompt = boundedText(requestContext.prompt, MAX_USER_PROMPT).trim();
     if (!prompt) throw new Error('请输入要交给 Codex 的任务。');
 
-    const threadId = normalizedThreadId(requestContext.threadId);
-    const permissions = this.permissions();
+    const taskKind = normalizedTaskKind(requestContext.taskKind);
+    const threadId = taskKind === 'chat' ? normalizedThreadId(requestContext.threadId) : '';
+    // Text transformations only return replacement text. Force read-only so an
+    // inline edit or translation can never modify project files behind the UI.
+    const permissions = taskKind === 'chat' ? this.permissions() : permissionProfiles['read-only'];
     const model = this.model;
     const reasoningEffort = this.reasoningEffort;
     let workingDirectory = project.path;
@@ -669,6 +723,7 @@ class CodexService {
       selectionEndLine: Number(requestContext.selectionEndLine) || 0,
       activeFileContent,
       compileOutput: requestContext.includeCompileLog ? compileOutput : '',
+      translationTarget: normalizedTranslationTarget(requestContext.translationTarget),
     };
 
     const job = {
@@ -686,13 +741,17 @@ class CodexService {
       fileChanges: new Map(),
       abortController: new AbortController(),
       threadId,
-      newThread: Boolean(requestContext.newThread),
+      newThread: taskKind === 'chat' ? Boolean(requestContext.newThread) : true,
+      taskKind,
       permissions,
       model,
       reasoningEffort,
       userRequest: prompt,
-      prompt: buildPrompt(context, permissions.mode),
+      prompt: taskKind === 'chat'
+        ? buildPrompt(context, permissions.mode)
+        : buildTextTaskPrompt(context, taskKind),
       contextSummary: {
+        taskKind,
         activeFile: context.activeFile,
         mainFile: context.mainFile,
         includesSelection: Boolean(context.selection),
@@ -715,7 +774,12 @@ class CodexService {
   async execute(job) {
     try {
       job.status = 'running';
-      this.emit(job, { type: 'status', status: 'running', message: 'Codex 正在读取项目并分析…' });
+      const runningMessage = job.taskKind === 'inline-edit'
+        ? 'Codex 正在生成选区替换…'
+        : job.taskKind === 'translation'
+          ? 'Codex 正在生成中英译文…'
+          : 'Codex 正在读取项目并分析…';
+      this.emit(job, { type: 'status', status: 'running', message: runningMessage });
       const client = await this.client();
       const threadOptions = {
         workingDirectory: job.projectPath,
@@ -735,7 +799,7 @@ class CodexService {
       if (!thread) {
         thread = client.startThread(threadOptions);
       }
-      this.projectThreads.set(job.projectId, thread);
+      if (job.taskKind === 'chat') this.projectThreads.set(job.projectId, thread);
 
       const { events } = await thread.runStreamed(job.prompt, { signal: job.abortController.signal });
       for await (const event of events) {
@@ -826,7 +890,11 @@ class CodexService {
         ? `Codex 已完成 · 修改 ${uniqueCompletedFiles.size} 个文件`
         : fileChangesFailed || failedChanges.length
           ? 'Codex 已结束 · 文件修改失败'
-          : 'Codex 已完成分析。';
+          : job.taskKind === 'inline-edit'
+            ? '行内修改已生成。'
+            : job.taskKind === 'translation'
+              ? '中英翻译已生成。'
+              : 'Codex 已完成分析。';
       this.emit(job, {
         type: 'done',
         status: 'completed',
@@ -916,6 +984,7 @@ function createCodexService(options = {}) {
 
 module.exports = {
   buildPrompt,
+  buildTextTaskPrompt,
   createCodexService,
   localTeXDisplayPrompt,
 };

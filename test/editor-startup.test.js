@@ -10,12 +10,13 @@ const initializer = source.slice(start, source.indexOf('\nfunction ', start + 1)
 
 function initialize(languageTools) {
   const options = {};
+  const commands = [];
   const editor = {
     setTheme() {}, setOptions(value) { Object.assign(options, value); },
     session: { setMode() {}, setUseWorker() {} },
     renderer: { setScrollMargin() {} }, setReadOnly() {},
     textInput: { getElement: () => ({ setAttribute() {} }) },
-    commands: { addCommand() {} },
+    commands: { addCommand(command) { commands.push(command); } },
   };
   const context = vm.createContext({
     window: { ace: { config: { set() {} }, edit: () => editor, require: () => languageTools } },
@@ -24,6 +25,7 @@ function initialize(languageTools) {
   });
   const result = vm.runInContext(`${initializer}\ninitializeCodeEditor()`, context);
   assert.equal(result, editor);
+  options.commands = commands;
   return options;
 }
 
@@ -41,6 +43,13 @@ test('editor startup registers usable project file completions', () => {
     assert.equal(error, null);
     assert.deepEqual(Array.from(results, item => item.value), ['Sections/intro.tex']);
   });
+});
+
+test('editor startup registers Cursor-style inline edit shortcuts', () => {
+  const options = initialize(undefined);
+  const inlineEdit = options.commands.find((command) => command.name === 'localtexInlineEdit');
+  assert.equal(inlineEdit.bindKey.win, 'Ctrl-K');
+  assert.equal(inlineEdit.bindKey.mac, 'Command-K');
 });
 
 test('page loads the completion extension before app startup', () => {
